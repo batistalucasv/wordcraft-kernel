@@ -11,9 +11,10 @@ Desenvolvido especialmente para pesquisa em **Ecologia**, ciência de dados e **
 - **100% Rust Nativo:** Sem C-FFI instável, sem código inseguro (`unsafe_code = "forbid"`), sem panics (`clippy::unwrap_used` negado no código de produção).
 - **Paridade R e Python:** Mesma interface, mesma captura de saídas e tratamento de erros.
 - **Proteção "Never Crash":** Execução em processos isolados com controle de tempo (*timeout* ajustável) para encerrar scripts travados ou em loop infinito.
-- **Captura Automática de Gráficos:** Detecta e extrai plots em alta resolução gerados por:
+- **Captura Automática de Gráficos:** Detecta e extrai plots tanto em formato vetorial sem perda (**SVG**) quanto raster em alta resolução (**PNG**) gerados por:
   - **R:** Funções básicas (`plot()`, `hist()`, `boxplot()`) e pacotes modernos (`ggplot2`).
   - **Python:** `matplotlib`, `seaborn`, etc.
+  - Suporte aos modos: `PlotFormat::Png`, `PlotFormat::Svg` e `PlotFormat::Both`.
 - **Captura Limpa de Saída:** Separação estrita de `stdout`, `stderr`, código de saída e tempo de execução decorrido.
 
 ---
