@@ -15,6 +15,7 @@ Desenvolvido especialmente para pesquisa em **Ecologia**, ciência de dados e **
   - **R:** Funções básicas (`plot()`, `hist()`, `boxplot()`) e pacotes modernos (`ggplot2`).
   - **Python:** `matplotlib`, `seaborn`, etc.
 - **Captura Limpa de Saída:** Separação estrita de `stdout`, `stderr`, código de saída e tempo de execução decorrido.
+- **Biblioteca de Templates:** Trechos prontos e comentados de ecologia e estatística em R e Python, descritos em `templates`.
 
 ---
 
@@ -70,6 +71,46 @@ fn main() {
     }
 }
 ```
+
+---
+
+## Biblioteca de templates
+
+O módulo `wordcraft_kernel::templates` traz sete trechos completos e comentados
+que já rodam com dados sintéticos:
+
+| ID do template | Linguagem | Categoria | Pacotes |
+|---|---|---|---|
+| `r.shannon-simpson` | R | Diversidade | `vegan` |
+| `r.species-accumulation` | R | Acumulação de espécies | `vegan` |
+| `r.lm-confidence` | R | Regressão | `ggplot2` |
+| `r.ttest-anova` | R | Testes de hipótese | `ggplot2` |
+| `python.data-ingest` | Python | Ingestão de dados | `pandas` |
+| `python.correlation-heatmap` | Python | Correlação | `pandas`, `seaborn`, `matplotlib` |
+| `python.lm-tests` | Python | Regressão | `numpy`, `pandas`, `scipy` |
+
+Navegue com `templates::all()`, `templates::find(id)`,
+`templates::by_language(...)` e `templates::by_category(...)`, e então renderize
+e execute um deles:
+
+```rust
+use wordcraft_kernel::{execute, templates, ExecutionRequest, KernelError};
+
+fn main() -> Result<(), KernelError> {
+    let template = templates::find("r.ttest-anova").expect("template embutido");
+    let script = template.render(&[("title", "Biomassa em três áreas")])?;
+    let result = execute(&ExecutionRequest::new(template.language, script))?;
+    println!("{}", result.stdout);
+    Ok(())
+}
+```
+
+Todo parâmetro tem um valor padrão, então `render_default()` sempre produz um
+script executável. Os valores são inseridos literalmente, porque são código
+(uma expressão R, um nome de coluna, um caminho); cite ou valide entradas não
+confiáveis para a linguagem de destino antes de renderizar. A suíte de testes
+executa cada trecho quando o interpretador e os pacotes listados estão
+instalados, e o ignora com uma mensagem caso contrário.
 
 ---
 

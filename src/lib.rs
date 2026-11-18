@@ -2,6 +2,8 @@
 //!
 //! Provides isolated, safe subprocess execution with timeout enforcement,
 //! output capture (stdout, stderr, exit status), and plot interception.
+//! [`templates`] ships ready-made ecology and statistics snippets for both
+//! languages.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -10,6 +12,8 @@
     clippy::todo,
     clippy::unreachable
 )]
+
+pub mod templates;
 
 use std::fmt;
 use std::fs;
@@ -152,6 +156,18 @@ pub enum KernelError {
 
     #[error("Failed to prepare script: {0}")]
     ScriptPreparation(String),
+
+    #[error("Template '{template}' has no parameter named '{parameter}'")]
+    UnknownTemplateParameter { template: String, parameter: String },
+
+    #[error("Template '{template}' references an undefined placeholder '{placeholder}'")]
+    UndefinedPlaceholder {
+        template: String,
+        placeholder: String,
+    },
+
+    #[error("Template '{template}' has an unterminated placeholder")]
+    UnterminatedPlaceholder { template: String },
 }
 
 /// Check if the interpreter for a given language is available on the host system.
@@ -313,7 +329,10 @@ fn prepare_wrapped_code(
                 format!(
                     r#"options(warn = 1)
 .wc_plot_file <- "{plot_path_str}"
-setHook("plot.new", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
+.wc_mark_plot <- function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv)
+setHook("plot.new", .wc_mark_plot)
+# ggplot2 and lattice draw through grid, which never fires the plot.new hook.
+setHook("grid.newpage", .wc_mark_plot)
 png(.wc_plot_file, width = 1600, height = 1200, res = 200)
 tryCatch({{
 {code}
@@ -361,5 +380,7 @@ if _has_plt and plt is not None:
     }
 }
 
+#[cfg(test)]
+mod template_tests;
 #[cfg(test)]
 mod tests;

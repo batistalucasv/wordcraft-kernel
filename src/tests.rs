@@ -146,6 +146,42 @@ plot(x, y, main = "Test Curve")
 }
 
 #[test]
+fn r_grid_plot_capture() {
+    if !is_language_available(CodeLanguage::R) {
+        return;
+    }
+    let has_ggplot2 = Command::new(CodeLanguage::R.binary_name())
+        .args([
+            "--vanilla",
+            "-e",
+            "quit(status = if (requireNamespace('ggplot2', quietly = TRUE)) 0L else 1L)",
+        ])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !has_ggplot2 {
+        return;
+    }
+
+    let code = r#"
+library(ggplot2)
+print(
+  ggplot(mtcars, aes(x = wt, y = mpg)) +
+    geom_point() +
+    theme_minimal()
+)
+"#;
+    let req = ExecutionRequest::new(CodeLanguage::R, code);
+    let result = execute(&req).expect("execution failed");
+
+    assert!(result.success);
+    assert!(
+        result.plot_png.is_some(),
+        "grid-based plots (ggplot2, lattice) must be captured too"
+    );
+}
+
+#[test]
 fn python_plot_capture() {
     if !is_language_available(CodeLanguage::Python) {
         return;
@@ -160,8 +196,7 @@ plt.plot([1, 2, 3], [10, 20, 30])
     let result = execute(&req).expect("execution failed");
 
     assert!(result.success);
-    if result.plot_png.is_some() {
-        let png_bytes = result.plot_png.unwrap();
+    if let Some(png_bytes) = result.plot_png {
         assert!(png_bytes.starts_with(&[0x89, b'P', b'N', b'G']));
     }
 }
