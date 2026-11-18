@@ -1,0 +1,15 @@
+[package]
+name = "wordcraft-kernel"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Safe, isolated R and Python execution runner for WordCraft and interactive literate computing"
+readme = "README.md"
+repository = "https://github.com/batistalucasv/wordcraft-kernel"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
