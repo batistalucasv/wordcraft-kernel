@@ -530,9 +530,11 @@ fn terminate_process_group(
         ManagedChild::Other(child) => child.kill(),
     };
 
-    // `TerminateJobObject` is asynchronous, and `ManagedChild::try_wait` only
-    // polls the leader, so the job notification is still pending here and
-    // `wait` returns once every job member has exited.
+    // `TerminateJobObject` terminates every job member asynchronously. The
+    // crate's `wait` consumes one completion-port packet and then reaps the
+    // leader; command-group exposes no job-accounting query, so proving the
+    // job is empty would need unsafe WinAPI, which this crate forbids. Keep
+    // the wait as the only job-aware signal available.
     #[cfg(windows)]
     let wait = if already_reaped && group_kill.is_err() {
         Ok(())

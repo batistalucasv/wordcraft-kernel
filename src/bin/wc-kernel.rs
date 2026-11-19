@@ -20,7 +20,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use wordcraft_kernel::{
     CodeLanguage, ExecutionRequest, KernelError, PlotFormat, execute_with_cancellation,
@@ -58,6 +58,9 @@ EXAMPLES:
 ";
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Longest a diagnostic write may wait for a stderr reader.
+const OUTPUT_WRITE_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq, Eq)]
 enum CliError {
@@ -181,13 +184,14 @@ enum OutputStream {
 /// Write through a helper thread so a full pipe cannot trap the run.
 ///
 /// A closed pipe keeps the script's own exit status; a cancelled run returns
-/// `Interrupted`, which `main` maps to status 130.
+/// `Interrupted`, which `main` maps to status 130. Diagnostics pass `None` so
+/// they still go out after a cancellation, bounded by [`OUTPUT_WRITE_GRACE`].
 fn write_stream(
     stream: OutputStream,
     bytes: Vec<u8>,
-    cancelled: &AtomicBool,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<(), CliError> {
-    if cancelled.load(Ordering::Acquire) {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
         return Err(CliError::Interrupted);
     }
     let (sender, receiver) = mpsc::channel();
@@ -210,8 +214,15 @@ fn write_stream(
         })
         .map_err(|error| CliError::Runtime(format!("failed to start output writer: {error}")))?;
 
+    let deadline = Instant::now() + OUTPUT_WRITE_GRACE;
     loop {
-        match receiver.recv_timeout(Duration::from_millis(25)) {
+        let received = receiver.recv_timeout(Duration::from_millis(25));
+        // A cancellation may race the writer finishing, so it has to win over
+        // a completed write or a closed pipe.
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(CliError::Interrupted);
+        }
+        match received {
             Ok(Ok(())) => return Ok(()),
             Ok(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
             Ok(Err(error)) => {
@@ -220,8 +231,8 @@ fn write_stream(
                 )));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if cancelled.load(Ordering::Acquire) {
-                    return Err(CliError::Interrupted);
+                if cancelled.is_none() && Instant::now() >= deadline {
+                    return Ok(());
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -234,11 +245,24 @@ fn write_stream(
 }
 
 fn write_stdout(text: &str, cancelled: &AtomicBool) -> Result<(), CliError> {
-    write_stream(OutputStream::Stdout, text.as_bytes().to_vec(), cancelled)
+    write_stream(
+        OutputStream::Stdout,
+        text.as_bytes().to_vec(),
+        Some(cancelled),
+    )
 }
 
 fn write_stderr(text: &str, cancelled: &AtomicBool) -> Result<(), CliError> {
-    write_stream(OutputStream::Stderr, text.as_bytes().to_vec(), cancelled)
+    write_stream(
+        OutputStream::Stderr,
+        text.as_bytes().to_vec(),
+        Some(cancelled),
+    )
+}
+
+/// Best-effort diagnostics: never abort on cancellation and never hang.
+fn write_diagnostic(text: &str) -> Result<(), CliError> {
+    write_stream(OutputStream::Stderr, text.as_bytes().to_vec(), None)
 }
 
 /// Read all of stdin while staying responsive to cancellation.
@@ -713,16 +737,24 @@ fn main() -> ExitCode {
     match run(&cancelled) {
         Ok(code) => code,
         Err(CliError::Usage(msg)) => {
-            let mut stderr = io::stderr();
-            let _ = writeln!(stderr, "wc-kernel: error: {msg}");
-            let _ = writeln!(stderr, "Try 'wc-kernel --help' for more information.");
-            ExitCode::from(2)
+            let _ = write_diagnostic(&format!(
+                "wc-kernel: error: {msg}\nTry 'wc-kernel --help' for more information.\n"
+            ));
+            cancelled_exit(&cancelled, 2)
         }
         Err(CliError::Runtime(msg)) => {
-            let _ = writeln!(io::stderr(), "wc-kernel: error: {msg}");
-            ExitCode::from(1)
+            let _ = write_diagnostic(&format!("wc-kernel: error: {msg}\n"));
+            cancelled_exit(&cancelled, 1)
         }
         Err(CliError::Interrupted) => ExitCode::from(130),
+    }
+}
+
+fn cancelled_exit(cancelled: &AtomicBool, code: u8) -> ExitCode {
+    if cancelled.load(Ordering::Acquire) {
+        ExitCode::from(130)
+    } else {
+        ExitCode::from(code)
     }
 }
 

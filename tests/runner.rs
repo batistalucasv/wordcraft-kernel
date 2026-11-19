@@ -434,22 +434,34 @@ print(child.pid, flush=True)
     let result = execute(&req).expect("execution failed");
     let child_pid = result.stdout.trim().to_string();
 
-    let alive = Command::new("kill")
-        .args(["-0", child_pid.as_str()])
-        .stderr(Stdio::null())
-        .status()
-        .expect("check test child");
-    if alive.success() {
-        let _ = Command::new("kill")
-            .args(["-KILL", child_pid.as_str()])
-            .stderr(Stdio::null())
-            .status();
-    }
     assert!(result.success);
-    assert!(
-        !alive.success(),
-        "same-group descendant survived the interpreter's exit"
-    );
+    assert_descendant_stopped(&child_pid);
+}
+
+/// Pass when the descendant is gone or a zombie; the environment may not reap
+/// orphans, and a zombie no longer runs.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn assert_descendant_stopped(pid: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let state = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .expect("probe descendant state");
+        let state = String::from_utf8_lossy(&state.stdout);
+        let state = state.trim();
+        if state.is_empty() || state.starts_with('Z') {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = Command::new("kill")
+                .args(["-KILL", pid])
+                .stderr(Stdio::null())
+                .status();
+            panic!("same-group descendant {pid} outlived the interpreter");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 #[test]

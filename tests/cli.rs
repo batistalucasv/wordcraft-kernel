@@ -342,39 +342,52 @@ fn cli_ctrl_c_interrupts_a_blocked_output_write() {
     }
 
     let fixture = TestDir::new("wc-output-block");
-    let working_dir = fixture.join("cwd");
     let scratch_dir = fixture.join("scratch");
-    fs::create_dir(&working_dir).expect("create working directory");
     fs::create_dir(&scratch_dir).expect("create scratch directory");
 
-    // 4 MiB fills the pipe buffer, so the CLI blocks writing the result.
-    let code = "from pathlib import Path\nprint('x' * (4 * 1024 * 1024))\nPath('printed').touch()";
+    // 4 MiB exceeds the pipe capacity, so the CLI cannot finish writing it.
     let mut child = Command::new(binary_path())
-        .args(["--lang", "py", "--eval", code, "--cwd"])
-        .arg(&working_dir)
-        .arg("--no-plot")
+        .args([
+            "--lang",
+            "py",
+            "-e",
+            "print('x' * (4 * 1024 * 1024))",
+            "--no-plot",
+        ])
         .env("TMPDIR", &scratch_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn wc-kernel");
 
-    // Keep the read end open and never drain it.
+    // Keep the read end open and never drain it; readability proves the CLI
+    // has started writing into the pipe.
+    use std::os::fd::AsFd;
     let stdout = child.stdout.take().expect("stdout piped");
-    let printed = working_dir.join("printed");
-    let startup_deadline = Instant::now() + Duration::from_secs(10);
-    while !printed.is_file() {
-        if let Some(status) = child.try_wait().expect("check wc-kernel status") {
-            panic!("wc-kernel exited before writing output: {status}");
+    let poll_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut fds = [nix::poll::PollFd::new(
+            stdout.as_fd(),
+            nix::poll::PollFlags::POLLIN,
+        )];
+        match nix::poll::poll(&mut fds, 100u16) {
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => panic!("poll wc-kernel stdout: {error}"),
         }
-        assert!(
-            Instant::now() < startup_deadline,
-            "user code did not start before the deadline"
-        );
-        std::thread::sleep(Duration::from_millis(10));
+        if fds[0]
+            .revents()
+            .is_some_and(|flags| flags.contains(nix::poll::PollFlags::POLLIN))
+        {
+            break;
+        }
+        if Instant::now() >= poll_deadline {
+            child.kill().expect("stop blocked wc-kernel");
+            let _ = child.wait();
+            drop(stdout);
+            panic!("wc-kernel did not write to the blocked pipe");
+        }
     }
-    // Let the interpreter exit and the CLI start writing into the full pipe.
-    std::thread::sleep(Duration::from_millis(500));
 
     let pid = i32::try_from(child.id()).expect("wc-kernel PID fits in i32");
     nix::sys::signal::kill(
