@@ -251,6 +251,44 @@ pub fn which_binary(language: CodeLanguage) -> Option<PathBuf> {
     None
 }
 
+/// Create an execution workspace that this process owns exclusively.
+///
+/// `create_dir` (never `create_dir_all`) fails when the generated path already
+/// exists, so cleanup can only remove files written by this execution. A stale
+/// directory from a recycled process id is skipped in favour of a fresh id.
+fn create_execution_dir() -> Result<PathBuf, KernelError> {
+    for _ in 0..16 {
+        let unique_id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "wordcraft-chunk-{}-{}",
+            std::process::id(),
+            unique_id
+        ));
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = fs::DirBuilder::new();
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(KernelError::Io(format!(
+                    "create temp dir {}: {error}",
+                    dir.display()
+                )));
+            }
+        }
+    }
+    Err(KernelError::Io(
+        "could not create a unique execution directory".to_string(),
+    ))
+}
+
 /// Execute a code chunk and collect outputs.
 pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelError> {
     let binary =
@@ -259,14 +297,7 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
             binary: request.language.binary_name(),
         })?;
 
-    let unique_id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let temp_dir = std::env::temp_dir().join(format!(
-        "wordcraft-chunk-{}-{}",
-        std::process::id(),
-        unique_id
-    ));
-    fs::create_dir_all(&temp_dir)
-        .map_err(|e| KernelError::Io(format!("create temp dir {}: {e}", temp_dir.display())))?;
+    let temp_dir = create_execution_dir()?;
 
     let plot_png_path = temp_dir.join("__wordcraft_plot__.png");
     let plot_svg_path = temp_dir.join("__wordcraft_plot__.svg");
