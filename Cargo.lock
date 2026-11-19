@@ -629,6 +629,7 @@ version = "0.1.0"
 dependencies = [
  "command-group",
  "ctrlc",
+ "getrandom",
  "nix 0.29.0",
  "proptest",
  "rustix",
