@@ -310,6 +310,17 @@ fn effective_plot_format_combinations() {
 }
 
 #[test]
+fn svg_completion_filter() {
+    let body = "x".repeat(80);
+
+    assert!(is_complete_svg(&format!("<svg>{body}</svg>")));
+    assert!(is_complete_svg(&format!("<svg>{body}</svg>\n")));
+    assert!(!is_complete_svg(&format!("<svg>{body}")));
+    assert!(!is_complete_svg(&format!("<svg>{body}</svg")));
+    assert!(!is_complete_svg("<svg></svg>"));
+}
+
+#[test]
 fn python_plot_png_capture() {
     if !python_has_matplotlib() {
         return;

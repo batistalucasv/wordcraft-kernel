@@ -328,7 +328,7 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     if request.capture_plots && plot_format.captures_svg() && plot_svg_path.is_file() {
         plot_svg = fs::read_to_string(&plot_svg_path)
             .ok()
-            .filter(|content| content.len() > 64 && content.contains("<svg"));
+            .filter(|content| is_complete_svg(content));
     }
 
     // Best-effort cleanup of temporary files
@@ -378,6 +378,14 @@ fn wait_with_timeout(
             }
         }
     }
+}
+
+/// Whether `content` is a non-trivial and complete SVG document.
+///
+/// A truncated file can contain `<svg` and exceed the size threshold, so the
+/// closing root element is required to avoid returning partial output.
+fn is_complete_svg(content: &str) -> bool {
+    content.len() > 64 && content.contains("<svg") && content.trim_end().ends_with("</svg>")
 }
 
 /// Wrap user code to intercept plots in PNG, SVG, or both.
