@@ -52,10 +52,13 @@ OPTIONS:
     --plot-format <FMT>        Plot capture format: 'png', 'svg', or 'both' [default: png].
     --no-plot                  Disable automatic plot interception.
     -C, --cwd, --working-dir <DIR>
-                               Working directory for script execution.
+                               Working directory for script execution
+                               [default: current directory].
     -h, --help                 Display help information and exit.
     -V, --version              Display version information and exit.
 ```
+
+Scripts run in the directory where you invoked `wc-kernel` unless `-C` is given, so relative reads and writes resolve there. When running a Python file with `--file`, its directory is also added to the module search path, so sibling imports keep working.
 
 ### CLI Examples
 

@@ -17,7 +17,6 @@ pub mod templates;
 
 use std::fmt;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
@@ -162,6 +161,9 @@ pub struct ExecutionRequest {
     /// Whether SVG should be preferred over the default PNG capture.
     #[serde(default)]
     pub prefer_svg: bool,
+    /// Extra Python module search directories, prepended to `PYTHONPATH`.
+    #[serde(default)]
+    pub python_path: Vec<PathBuf>,
     /// Optional working directory.
     pub working_dir: Option<PathBuf>,
 }
@@ -176,6 +178,7 @@ impl ExecutionRequest {
             capture_plots: true,
             plot_format: PlotFormat::Png,
             prefer_svg: false,
+            python_path: Vec::new(),
             working_dir: None,
         }
     }
@@ -214,6 +217,12 @@ impl ExecutionRequest {
             (PlotFormat::Png, true) => PlotFormat::Svg,
             (format, _) => format,
         }
+    }
+
+    /// Add a Python module search directory.
+    pub fn with_python_path(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.python_path.push(dir.into());
+        self
     }
 
     /// Set an explicit working directory.
@@ -343,6 +352,8 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     let tables_file = temp_dir.join("__wordcraft_tables__.json");
     let user_file = temp_dir.join(format!("user.{}", request.language.extension()));
     let script_file = temp_dir.join(format!("script.{}", request.language.extension()));
+    let stdout_path = temp_dir.join("__wordcraft_stdout__.log");
+    let stderr_path = temp_dir.join("__wordcraft_stderr__.log");
     let plot_format = request.effective_plot_format();
 
     fs::write(&user_file, request.code.as_bytes()).map_err(|e| {
@@ -371,13 +382,30 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
         }
     }
     cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    // Capture to files rather than pipes: a full pipe buffer cannot block the
+    // interpreter, output written before a timeout survives, and no reader
+    // threads are left behind when a descendant keeps an inherited handle open.
+    cmd.stdout(Stdio::from(create_capture_file(&stdout_path).map_err(
+        |e| KernelError::Io(format!("create {}: {e}", stdout_path.display())),
+    )?));
+    cmd.stderr(Stdio::from(create_capture_file(&stderr_path).map_err(
+        |e| KernelError::Io(format!("create {}: {e}", stderr_path.display())),
+    )?));
 
     if let Some(ref dir) = request.working_dir {
         cmd.current_dir(dir);
     } else {
-        cmd.current_dir(&temp_dir);
+        cmd.current_dir(temp_dir);
+    }
+
+    if request.language == CodeLanguage::Python && !request.python_path.is_empty() {
+        let mut paths = request.python_path.clone();
+        if let Some(existing) = std::env::var_os("PYTHONPATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        let joined = std::env::join_paths(&paths)
+            .map_err(|e| KernelError::Io(format!("build PYTHONPATH: {e}")))?;
+        cmd.env("PYTHONPATH", joined);
     }
 
     let start_time = Instant::now();
@@ -389,19 +417,8 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
         wait_with_timeout(&mut child, Duration::from_millis(request.timeout_ms));
     let duration_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
-    let mut stdout = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let mut buf = Vec::new();
-        let _ = out.read_to_end(&mut buf);
-        stdout = String::from_utf8_lossy(&buf).into_owned();
-    }
-
-    let mut stderr = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        let mut buf = Vec::new();
-        let _ = err.read_to_end(&mut buf);
-        stderr = String::from_utf8_lossy(&buf).into_owned();
-    }
+    let stdout = read_capture(&stdout_path);
+    let stderr = read_capture(&stderr_path);
 
     let mut plot_png = None;
     if request.capture_plots && plot_format.captures_png() && plot_png_path.is_file() {
@@ -437,6 +454,23 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     })
 }
 
+/// Create an owner-only capture file for a child stream.
+fn create_capture_file(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn read_capture(path: &Path) -> String {
+    fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
+}
 /// Wait for child process with timeout. Kills the child if timeout is reached.
 fn wait_with_timeout(
     child: &mut Child,
