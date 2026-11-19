@@ -415,7 +415,7 @@ png(.wc_plot_png, width = 1600, height = 1200, res = 200)
 tryCatch({{
 {code}
 }}, finally = {{
-  if (dev.cur() != 1) dev.off()
+  while (dev.cur() != 1) dev.off()
   if (!exists(".wc_has_plot", envir = .GlobalEnv) || !get(".wc_has_plot", envir = .GlobalEnv)) {{
     if (file.exists(.wc_plot_png)) file.remove(.wc_plot_png)
   }}
@@ -431,7 +431,7 @@ svg(.wc_plot_svg, width = 8, height = 6)
 tryCatch({{
 {code}
 }}, finally = {{
-  if (dev.cur() != 1) dev.off()
+  while (dev.cur() != 1) dev.off()
   if (!exists(".wc_has_plot", envir = .GlobalEnv) || !get(".wc_has_plot", envir = .GlobalEnv)) {{
     if (file.exists(.wc_plot_svg)) file.remove(.wc_plot_svg)
   }}
@@ -442,28 +442,77 @@ tryCatch({{
                 r#"options(warn = 1)
 .wc_plot_png <- "{png_str}"
 .wc_plot_svg <- "{svg_str}"
-setHook("plot.new", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
-setHook("grid.newpage", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
+.wc_has_plot <- FALSE
 png(.wc_plot_png, width = 1600, height = 1200, res = 200)
-.wc_capture_device <- dev.cur()
-.wc_capture_devices <- dev.list()
-.wc_capture_device_type <- names(.wc_capture_devices)[match(.wc_capture_device, .wc_capture_devices)]
+.wc_capture_device <- as.integer(dev.cur())
+
+.wc_wrapper <- local({{
+  closed <- FALSE
+  has_plot <- FALSE
+  orig <- grDevices::dev.off
+  cap_dev <- .wc_capture_device
+  fn <- function(which = grDevices::dev.cur()) {{
+    target <- if (missing(which)) as.integer(grDevices::dev.cur()) else as.integer(which)[1]
+    if (!is.na(target) && target == cap_dev) {{
+      closed <<- TRUE
+    }}
+    orig(which)
+  }}
+  attr(fn, "driver") <- list(
+    orig = orig,
+    cap_dev = cap_dev,
+    is_closed = function() closed,
+    set_has_plot = function() {{ has_plot <<- TRUE }},
+    has_plot = function() has_plot
+  )
+  fn
+}})
+
+unlockBinding("dev.off", as.environment("package:grDevices"))
+assign("dev.off", .wc_wrapper, envir = as.environment("package:grDevices"))
+lockBinding("dev.off", as.environment("package:grDevices"))
+
+unlockBinding("dev.off", asNamespace("grDevices"))
+assign("dev.off", .wc_wrapper, envir = asNamespace("grDevices"))
+lockBinding("dev.off", asNamespace("grDevices"))
+
+.wc_hook <- function() {{
+  assign(".wc_has_plot", TRUE, envir = .GlobalEnv)
+  drv <- attr(tryCatch(as.environment("package:grDevices")$dev.off, error = function(e) NULL), "driver")
+  if (!is.null(drv)) drv$set_has_plot()
+}}
+setHook("plot.new", .wc_hook)
+setHook("grid.newpage", .wc_hook)
 dev.control("enable")
 tryCatch({{
 {code}
 }}, finally = {{
-  if (exists(".wc_has_plot", envir = .GlobalEnv) && get(".wc_has_plot", envir = .GlobalEnv)) {{
-    .wc_open_devices <- dev.list()
-    .wc_device_index <- match(.wc_capture_device, .wc_open_devices)
-    if (!is.na(.wc_device_index) &&
-        identical(names(.wc_open_devices)[.wc_device_index], .wc_capture_device_type)) {{
-      dev.set(.wc_capture_device)
+  drv <- attr(tryCatch(as.environment("package:grDevices")$dev.off, error = function(e) NULL), "driver")
+  if (!is.null(drv)) {{
+    orig <- drv$orig
+    unlockBinding("dev.off", as.environment("package:grDevices"))
+    assign("dev.off", orig, envir = as.environment("package:grDevices"))
+    lockBinding("dev.off", as.environment("package:grDevices"))
+    unlockBinding("dev.off", asNamespace("grDevices"))
+    assign("dev.off", orig, envir = asNamespace("grDevices"))
+    lockBinding("dev.off", asNamespace("grDevices"))
+  }}
+
+  has_plot <- (exists(".wc_has_plot", envir = .GlobalEnv) && isTRUE(get(".wc_has_plot", envir = .GlobalEnv))) ||
+              (!is.null(drv) && isTRUE(drv$has_plot()))
+  is_closed <- if (!is.null(drv)) isTRUE(drv$is_closed()) else FALSE
+  cap_dev <- if (!is.null(drv)) drv$cap_dev else .wc_capture_device
+
+  if (has_plot && !is_closed) {{
+    open_devs <- dev.list()
+    if (!is.null(open_devs) && cap_dev %in% open_devs) {{
+      dev.set(cap_dev)
       dev.copy(svg, .wc_plot_svg, width = 8, height = 6)
       if (dev.cur() != 1) dev.off()
     }}
   }}
-  if (dev.cur() != 1) dev.off()
-  if (!exists(".wc_has_plot", envir = .GlobalEnv) || !get(".wc_has_plot", envir = .GlobalEnv)) {{
+  while (dev.cur() != 1) dev.off()
+  if (!has_plot) {{
     if (file.exists(.wc_plot_png)) file.remove(.wc_plot_png)
     if (file.exists(.wc_plot_svg)) file.remove(.wc_plot_svg)
   }}

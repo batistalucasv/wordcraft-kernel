@@ -261,6 +261,29 @@ plot(5:1)
     );
 }
 
+#[test]
+fn r_plot_both_capture_device_replaced_with_same_type_by_user() {
+    if !is_language_available(CodeLanguage::R) {
+        return;
+    }
+
+    let code = r#"
+plot(1:5)
+dev.off()
+png(tempfile(fileext = ".png"))
+plot(5:1)
+"#;
+    let req = ExecutionRequest::new(CodeLanguage::R, code).with_plot_format(PlotFormat::Both);
+    let result = execute(&req).expect("execution failed");
+
+    assert!(result.success);
+    assert!(result.plot_png.is_some(), "Expected completed PNG bytes");
+    assert!(
+        result.plot_svg.is_none(),
+        "Must not copy the replacement same-type device as the SVG"
+    );
+}
+
 fn python_has_matplotlib() -> bool {
     if !is_language_available(CodeLanguage::Python) {
         return false;
