@@ -16,40 +16,51 @@ fn chunk(language: CodeLanguage, code: &str) -> ExecutionRequest {
     ExecutionRequest::new(language, code).with_timeout(10_000)
 }
 
-fn python_has_matplotlib() -> bool {
-    if !is_language_available(CodeLanguage::Python) {
+fn session_probe(language: CodeLanguage, id: &str, code: &str) -> bool {
+    if !is_language_available(language) {
         return false;
     }
-    let req = ExecutionRequest::new(
-        CodeLanguage::Python,
-        "import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt",
-    )
-    .with_timeout(5_000);
-    execute(&req).map(|res| res.success).unwrap_or(false)
+    let mut manager = SessionManager::new().with_idle_timeout(Duration::from_secs(5));
+    let request = ExecutionRequest::new(language, code).with_timeout(20_000);
+    let result = manager.execute(id, &request);
+    manager.close_session(id);
+    match result {
+        Ok(res) => res.success,
+        Err(error) => panic!("graphics probe infrastructure error for {language:?}: {error}"),
+    }
+}
+
+fn python_has_matplotlib() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        session_probe(
+            CodeLanguage::Python,
+            "probe-matplotlib",
+            "import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt",
+        )
+    })
 }
 
 fn r_has_png_device() -> bool {
-    if !is_language_available(CodeLanguage::R) {
-        return false;
-    }
-    let req = ExecutionRequest::new(
-        CodeLanguage::R,
-        "tf <- tempfile(fileext = '.png'); png(tf); dev.off(); unlink(tf)",
-    )
-    .with_timeout(5_000);
-    execute(&req).map(|res| res.success).unwrap_or(false)
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        session_probe(
+            CodeLanguage::R,
+            "probe-r-png",
+            "tf <- tempfile(fileext = '.png'); png(tf); dev.off(); unlink(tf)",
+        )
+    })
 }
 
 fn r_has_svg_device() -> bool {
-    if !is_language_available(CodeLanguage::R) {
-        return false;
-    }
-    let req = ExecutionRequest::new(
-        CodeLanguage::R,
-        "tf <- tempfile(fileext = '.svg'); grDevices::svg(tf); grDevices::dev.off(); unlink(tf)",
-    )
-    .with_timeout(5_000);
-    execute(&req).map(|res| res.success).unwrap_or(false)
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        session_probe(
+            CodeLanguage::R,
+            "probe-r-svg",
+            "tf <- tempfile(fileext = '.svg'); grDevices::svg(tf); grDevices::dev.off(); unlink(tf)",
+        )
+    })
 }
 
 #[test]
@@ -270,9 +281,32 @@ fn session_timeout_kills_the_daemon() {
     assert!(res_warm.success);
     assert_eq!(res_warm.stdout.trim(), "warm");
 
+    let marker_dir = std::env::temp_dir().join(format!(
+        "wordcraft-descendant-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir(&marker_dir).expect("create descendant dir");
+    let marker = marker_dir.join("alive.marker");
+    let child_script = marker_dir.join("child.py");
+    let marker_literal =
+        serde_json::to_string(&marker.to_string_lossy()).expect("encode marker path");
+    fs::write(
+        &child_script,
+        format!("import time\ntime.sleep(0.8)\nopen({marker_literal}, 'w').write('alive')\n"),
+    )
+    .expect("write descendant script");
+    let script_literal =
+        serde_json::to_string(&child_script.to_string_lossy()).expect("encode script path");
+
     let hang = ExecutionRequest::new(
         CodeLanguage::Python,
-        "import sys, time\nsys.stdout.write('started\\n')\nsys.stdout.flush()\ntime.sleep(10)",
+        format!(
+            "import subprocess, sys, time\nsubprocess.Popen([sys.executable, {script_literal}])\nprint('started', flush=True)\ntime.sleep(10)"
+        ),
     )
     .with_timeout(300);
     let result = manager
@@ -287,12 +321,19 @@ fn session_timeout_kills_the_daemon() {
     );
     assert!(!manager.contains("py-timeout"));
 
+    std::thread::sleep(Duration::from_millis(1_200));
+    assert!(
+        !marker.exists(),
+        "a timed-out chunk must reap descendants in its process group"
+    );
+
     let next = chunk(CodeLanguage::Python, "print('recovered')");
     let r2 = manager.execute("py-timeout", &next).expect("execute next");
     assert!(r2.success);
     assert_eq!(r2.stdout.trim(), "recovered");
 
     manager.close_session("py-timeout");
+    let _ = fs::remove_dir_all(&marker_dir);
 }
 
 #[test]
@@ -490,6 +531,85 @@ fn a_chunk_changes_the_working_directory_for_later_chunks() {
     assert_eq!(normalize(&actual_canon), normalize(&expected_canon));
 
     manager.close_session("py-cwd");
+}
+
+#[test]
+fn session_rejects_a_regular_file_as_working_directory() {
+    let Some(mut manager) = manager_for(CodeLanguage::Python) else {
+        return;
+    };
+
+    let file_path = std::env::temp_dir().join(format!(
+        "wordcraft-session-file-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::write(&file_path, b"not a directory").expect("write probe file");
+
+    let request =
+        chunk(CodeLanguage::Python, "print('should not run')").with_working_dir(&file_path);
+    let result = manager.execute("file-cwd", &request);
+    let _ = fs::remove_file(&file_path);
+
+    assert!(
+        result.is_err(),
+        "a regular file must not become a working dir"
+    );
+    assert!(
+        !manager.contains("file-cwd"),
+        "the invalid request must not occupy a session"
+    );
+}
+
+#[test]
+fn python_session_uses_request_python_path() {
+    let Some(mut manager) = manager_for(CodeLanguage::Python) else {
+        return;
+    };
+
+    let module_dir = std::env::temp_dir().join(format!(
+        "wordcraft-python-path-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir(&module_dir).expect("create module dir");
+    fs::write(
+        module_dir.join("wc_session_probe.py"),
+        b"VALUE = 'from-request-path'\n",
+    )
+    .expect("write probe module");
+
+    let request = chunk(
+        CodeLanguage::Python,
+        "import wc_session_probe; print(wc_session_probe.VALUE)",
+    )
+    .with_python_path(&module_dir);
+    let result = manager
+        .execute("py-path", &request)
+        .expect("execute with python_path");
+    assert!(result.success, "stderr: {}", result.stderr);
+    assert_eq!(result.stdout.trim(), "from-request-path");
+
+    // Request-scoped: the directory must not stay on sys.path for later chunks.
+    let probe_code = format!(
+        "import sys; print({} in sys.path)",
+        serde_json::to_string(&module_dir.to_string_lossy()).expect("encode module path")
+    );
+    let probe = chunk(CodeLanguage::Python, &probe_code);
+    let probe_result = manager
+        .execute("py-path", &probe)
+        .expect("execute path probe");
+    assert!(probe_result.success, "stderr: {}", probe_result.stderr);
+    assert_eq!(probe_result.stdout.trim(), "False");
+
+    manager.close_session("py-path");
+    let _ = fs::remove_dir_all(&module_dir);
 }
 
 #[test]
@@ -974,6 +1094,82 @@ cat("\nafter-subprocess\n")
     assert_eq!(res2.stdout.trim(), "ok");
 
     manager.close_session("r-subp");
+}
+
+#[cfg(unix)]
+#[test]
+fn r_subprocess_stderr_is_captured_in_the_chunk_result() {
+    let Some(mut manager) = manager_for(CodeLanguage::R) else {
+        return;
+    };
+
+    let code = r#"system("echo subprocess-diagnostic >&2")"#;
+    let res = manager
+        .execute("r-subp-stderr", &chunk(CodeLanguage::R, code))
+        .expect("exec subprocess stderr");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert!(
+        res.stderr.contains("subprocess-diagnostic"),
+        "chunk stderr must include the subprocess diagnostic, got: {:?}",
+        res.stderr
+    );
+
+    manager.close_session("r-subp-stderr");
+}
+
+#[cfg(unix)]
+#[test]
+fn r_output_written_after_a_chunk_does_not_leak_into_the_next_chunk() {
+    let Some(mut manager) = manager_for(CodeLanguage::R) else {
+        return;
+    };
+
+    let code = r#"system("sh -c 'sleep 0.4; echo late-output' &")"#;
+    let first = manager
+        .execute("r-late-output", &chunk(CodeLanguage::R, code))
+        .expect("exec background writer");
+    assert!(first.success, "stderr: {}", first.stderr);
+    assert!(
+        !first.stdout.contains("late-output"),
+        "the spawning chunk must not report the background output: {:?}",
+        first.stdout
+    );
+
+    std::thread::sleep(Duration::from_millis(700));
+
+    let second = manager
+        .execute(
+            "r-late-output",
+            &chunk(CodeLanguage::R, "cat('clean-chunk\\n')"),
+        )
+        .expect("exec next chunk");
+    assert!(second.success, "stderr: {}", second.stderr);
+    assert_eq!(second.stdout.trim(), "clean-chunk");
+
+    manager.close_session("r-late-output");
+}
+
+#[test]
+fn r_large_output_is_truncated_and_bounded() {
+    let Some(mut manager) = manager_for(CodeLanguage::R) else {
+        return;
+    };
+
+    let request = ExecutionRequest::new(CodeLanguage::R, "cat(strrep('x', 11 * 1024 * 1024))")
+        .with_timeout(30_000);
+    let res = manager
+        .execute("r-large-output", &request)
+        .expect("exec large output");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert!(res.output_truncated, "expected output_truncated to be set");
+    assert!(
+        res.stdout.len() <= crate::session::MAX_STREAM_BYTES,
+        "stdout size {} should be <= MAX_STREAM_BYTES {}",
+        res.stdout.len(),
+        crate::session::MAX_STREAM_BYTES
+    );
+
+    manager.close_session("r-large-output");
 }
 
 #[test]

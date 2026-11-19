@@ -293,9 +293,11 @@ Rules that apply to session code:
   requests arrive over an authenticated loopback socket.
 - Tabular data capture (`ExecutionResult::tables`) is supported in one-shot `execute()`;
   persistent sessions return `tables` as empty.
-- Subprocess output from Python user code is redirected to chunk output files, isolating the
-  protocol stream from spawned child processes. In R, subprocesses inherit null stdin and
-  standard descriptors redirected to chunk output files.
+- Subprocess output from Python user code is collected into the chunk's own output files,
+  isolating the protocol stream from spawned child processes. In R, subprocesses inherit
+  null stdin; their stdout and stderr are drained into the same chunk result as the
+  interpreter's own output. Output is capped per chunk: excess bytes are discarded and
+  `ExecutionResult::output_truncated` is set.
 - A chunk that exceeds `timeout_ms` terminates the daemon process tree; the call returns
   `timed_out` and the next call for that id starts a fresh interpreter.
 - Session ids belong to one language. Reusing an id with another language
