@@ -159,4 +159,11 @@ cargo test
 
 ## License
 
-Distributed under either the **MIT** or **Apache-2.0** license.
+Distributed under either the **MIT** or **Apache-2.0** license, at your option:
+
+- [LICENSE-MIT](LICENSE-MIT)
+- [LICENSE-APACHE](LICENSE-APACHE)
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
+this crate by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without
+any additional terms or conditions.
