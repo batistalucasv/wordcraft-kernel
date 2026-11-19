@@ -13,7 +13,6 @@
 
 use std::fmt;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
@@ -122,6 +121,9 @@ pub struct ExecutionRequest {
     /// Whether SVG should be preferred over the default PNG capture.
     #[serde(default)]
     pub prefer_svg: bool,
+    /// Extra Python module search directories, prepended to `PYTHONPATH`.
+    #[serde(default)]
+    pub python_path: Vec<PathBuf>,
     /// Optional working directory.
     pub working_dir: Option<PathBuf>,
 }
@@ -136,6 +138,7 @@ impl ExecutionRequest {
             capture_plots: true,
             plot_format: PlotFormat::Png,
             prefer_svg: false,
+            python_path: Vec::new(),
             working_dir: None,
         }
     }
@@ -174,6 +177,12 @@ impl ExecutionRequest {
             (PlotFormat::Png, true) => PlotFormat::Svg,
             (format, _) => format,
         }
+    }
+
+    /// Add a Python module search directory.
+    pub fn with_python_path(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.python_path.push(dir.into());
+        self
     }
 
     /// Set an explicit working directory.
@@ -262,12 +271,14 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
         std::process::id(),
         unique_id
     ));
-    fs::create_dir_all(&temp_dir)
-        .map_err(|e| KernelError::Io(format!("create temp dir {}: {e}", temp_dir.display())))?;
+    let workspace = TempWorkspace::create(temp_dir)?;
+    let temp_dir = workspace.path();
 
     let plot_png_path = temp_dir.join("__wordcraft_plot__.png");
     let plot_svg_path = temp_dir.join("__wordcraft_plot__.svg");
     let script_file = temp_dir.join(format!("script.{}", request.language.extension()));
+    let stdout_path = temp_dir.join("__wordcraft_stdout__.log");
+    let stderr_path = temp_dir.join("__wordcraft_stderr__.log");
     let plot_format = request.effective_plot_format();
 
     let wrapped_code = prepare_wrapped_code(
@@ -285,13 +296,30 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     let mut cmd = Command::new(&binary);
     cmd.arg(&script_file);
     cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    // Capture to files rather than pipes: a full pipe buffer cannot block the
+    // interpreter, output written before a timeout survives, and no reader
+    // threads are left behind when a descendant keeps an inherited handle open.
+    cmd.stdout(Stdio::from(create_capture_file(&stdout_path).map_err(
+        |e| KernelError::Io(format!("create {}: {e}", stdout_path.display())),
+    )?));
+    cmd.stderr(Stdio::from(create_capture_file(&stderr_path).map_err(
+        |e| KernelError::Io(format!("create {}: {e}", stderr_path.display())),
+    )?));
 
     if let Some(ref dir) = request.working_dir {
         cmd.current_dir(dir);
     } else {
-        cmd.current_dir(&temp_dir);
+        cmd.current_dir(temp_dir);
+    }
+
+    if request.language == CodeLanguage::Python && !request.python_path.is_empty() {
+        let mut paths = request.python_path.clone();
+        if let Some(existing) = std::env::var_os("PYTHONPATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        let joined = std::env::join_paths(&paths)
+            .map_err(|e| KernelError::Io(format!("build PYTHONPATH: {e}")))?;
+        cmd.env("PYTHONPATH", joined);
     }
 
     let start_time = Instant::now();
@@ -299,26 +327,12 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
         .spawn()
         .map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?;
 
-    // Drain both pipes while the interpreter runs; waiting first can deadlock
-    // once either pipe buffer fills.
-    let stdout_reader = spawn_output_reader(child.stdout.take());
-    let stderr_reader = spawn_output_reader(child.stderr.take());
-
     let (exit_status, timed_out) =
         wait_with_timeout(&mut child, Duration::from_millis(request.timeout_ms));
     let duration_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
-    // Bound the final drain so a leaked descendant holding a pipe cannot hang
-    // the kernel after the interpreter has exited.
-    let drain_timeout = Duration::from_secs(2);
-    let stdout_bytes = stdout_reader
-        .recv_timeout(drain_timeout)
-        .unwrap_or_default();
-    let stderr_bytes = stderr_reader
-        .recv_timeout(drain_timeout)
-        .unwrap_or_default();
-    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
-    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    let stdout = read_capture(&stdout_path);
+    let stderr = read_capture(&stderr_path);
 
     let mut plot_png = None;
     if request.capture_plots && plot_format.captures_png() && plot_png_path.is_file() {
@@ -333,12 +347,6 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
             .ok()
             .filter(|content| is_complete_svg(content));
     }
-
-    // Best-effort cleanup of temporary files
-    let _ = fs::remove_file(&script_file);
-    let _ = fs::remove_file(&plot_png_path);
-    let _ = fs::remove_file(&plot_svg_path);
-    let _ = fs::remove_dir(&temp_dir);
 
     let exit_code = exit_status.and_then(|s| s.code());
     let success = exit_status.map(|s| s.success()).unwrap_or(false) && !timed_out;
@@ -355,26 +363,53 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     })
 }
 
-/// Read a child output pipe on a background thread so the interpreter never
-/// blocks on a full pipe buffer.
-fn spawn_output_reader<R>(reader: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>>
-where
-    R: Read + Send + 'static,
-{
-    let (tx, rx) = std::sync::mpsc::channel();
-    match reader {
-        Some(mut pipe) => {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = pipe.read_to_end(&mut buf);
-                let _ = tx.send(buf);
-            });
+/// Scratch workspace for one execution, removed when it goes out of scope.
+struct TempWorkspace {
+    path: PathBuf,
+}
+
+impl TempWorkspace {
+    fn create(path: PathBuf) -> Result<Self, KernelError> {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
         }
-        None => {
-            let _ = tx.send(Vec::new());
-        }
+        builder
+            .create(&path)
+            .map_err(|e| KernelError::Io(format!("create temp dir {}: {e}", path.display())))?;
+        Ok(Self { path })
     }
-    rx
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempWorkspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Create an owner-only capture file for a child stream.
+fn create_capture_file(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn read_capture(path: &Path) -> String {
+    fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
 }
 
 /// Wait for child process with timeout. Kills the child if timeout is reached.

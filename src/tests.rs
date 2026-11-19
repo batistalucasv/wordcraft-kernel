@@ -130,6 +130,66 @@ fn python_timeout_kills_runaway_process() {
 }
 
 #[test]
+fn python_timeout_preserves_partial_stdout() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    let req = ExecutionRequest::new(
+        CodeLanguage::Python,
+        "import time\nprint('before timeout', flush=True)\ntime.sleep(5)",
+    )
+    .with_plot_capture(false)
+    .with_timeout(300);
+    let result = execute(&req).expect("execution failed");
+
+    assert!(result.timed_out);
+    assert!(result.stdout.contains("before timeout"));
+}
+
+#[test]
+fn python_output_survives_inherited_pipe_holder() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    // The grandchild inherits the capture handle and outlives the interpreter.
+    let code = r#"
+import subprocess, sys
+print("ready", flush=True)
+subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+"#;
+    let req = ExecutionRequest::new(CodeLanguage::Python, code).with_plot_capture(false);
+    let result = execute(&req).expect("execution failed");
+
+    assert!(result.success);
+    assert!(result.stdout.contains("ready"));
+}
+
+#[test]
+fn python_path_is_used_for_module_lookup() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    let helper_dir = std::env::temp_dir().join(format!("wc-python-path-{}", std::process::id()));
+    fs::create_dir_all(&helper_dir).expect("create helper dir");
+    fs::write(helper_dir.join("wc_helper.py"), "VALUE = 42\n").expect("write helper module");
+
+    let req = ExecutionRequest::new(
+        CodeLanguage::Python,
+        "import wc_helper\nprint(wc_helper.VALUE)",
+    )
+    .with_python_path(&helper_dir);
+    let result = execute(&req).expect("execution failed");
+
+    assert!(result.success);
+    assert_eq!(result.stdout.trim(), "42");
+
+    let _ = fs::remove_dir_all(&helper_dir);
+}
+
+#[test]
 fn r_basic_execution() {
     if !is_language_available(CodeLanguage::R) {
         return;

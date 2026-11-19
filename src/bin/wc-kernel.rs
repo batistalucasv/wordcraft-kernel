@@ -37,7 +37,8 @@ OPTIONS:
     --plot-format <FMT>        Plot capture format: 'png', 'svg', or 'both' [default: png].
     --no-plot                  Disable automatic plot interception.
     -C, --cwd, --working-dir <DIR>
-                               Working directory for script execution.
+                               Working directory for script execution
+                               [default: current directory].
     -h, --help                 Display this help message and exit.
     -V, --version              Display version information and exit.
 
@@ -316,13 +317,13 @@ fn run() -> Result<ExitCode, CliError> {
         None => return Ok(ExitCode::SUCCESS),
     };
 
-    let (code, inferred_lang) = if !cli.eval_snippets.is_empty() {
+    let (code, inferred_lang, source_dir) = if !cli.eval_snippets.is_empty() {
         if cli.file_path.is_some() || cli.read_stdin {
             return Err(CliError::Usage(
                 "cannot combine -e/--eval with --file, positional file, or --stdin".to_string(),
             ));
         }
-        (cli.eval_snippets.join("\n"), None)
+        (cli.eval_snippets.join("\n"), None, None)
     } else if let Some(ref path) = cli.file_path {
         if cli.read_stdin {
             return Err(CliError::Usage(
@@ -334,20 +335,23 @@ fn run() -> Result<ExitCode, CliError> {
             io::stdin()
                 .read_to_string(&mut buf)
                 .map_err(|e| CliError::Runtime(format!("failed to read from stdin: {e}")))?;
-            (buf, None)
+            (buf, None, None)
         } else {
             let content = fs::read_to_string(path).map_err(|e| {
                 CliError::Runtime(format!("failed to read file '{}': {e}", path.display()))
             })?;
             let inferred = infer_language_from_path(path);
-            (content, inferred)
+            let source_dir = fs::canonicalize(path)
+                .ok()
+                .and_then(|canonical| canonical.parent().map(Path::to_path_buf));
+            (content, inferred, source_dir)
         }
     } else if cli.read_stdin || !io::stdin().is_terminal() {
         let mut buf = String::new();
         io::stdin()
             .read_to_string(&mut buf)
             .map_err(|e| CliError::Runtime(format!("failed to read from stdin: {e}")))?;
-        (buf, None)
+        (buf, None, None)
     } else {
         return Err(CliError::Usage(
             "no code provided. Specify -e <code>, --file <path>, or pipe via stdin".to_string(),
@@ -372,8 +376,19 @@ fn run() -> Result<ExitCode, CliError> {
         .with_plot_capture(cli.capture_plots)
         .with_plot_format(plot_format);
 
-    if let Some(dir) = cli.working_dir {
-        req = req.with_working_dir(dir);
+    if language == CodeLanguage::Python
+        && let Some(ref dir) = source_dir
+    {
+        req = req.with_python_path(dir);
+    }
+
+    match cli.working_dir {
+        Some(dir) => req = req.with_working_dir(dir),
+        None => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Runtime(format!("failed to read current directory: {e}")))?;
+            req = req.with_working_dir(cwd);
+        }
     }
 
     let result = match execute(&req) {
@@ -383,6 +398,7 @@ fn run() -> Result<ExitCode, CliError> {
         }
     };
 
+    let mut export_error = None;
     if let Some(ref plot_path) = cli.out_plot {
         let target_format = plot_format_for_extension(plot_path).unwrap_or(match plot_format {
             PlotFormat::Svg => PlotFormat::Svg,
@@ -392,23 +408,33 @@ fn run() -> Result<ExitCode, CliError> {
         let written = match target_format {
             PlotFormat::Svg => {
                 if let Some(ref svg_str) = result.plot_svg {
-                    write_file_with_parent_dir(plot_path, svg_str.as_bytes())?;
-                    true
+                    match write_file_with_parent_dir(plot_path, svg_str.as_bytes()) {
+                        Ok(()) => true,
+                        Err(err) => {
+                            export_error = Some(err);
+                            false
+                        }
+                    }
                 } else {
                     false
                 }
             }
             PlotFormat::Png | PlotFormat::Both => {
                 if let Some(ref bytes) = result.plot_png {
-                    write_file_with_parent_dir(plot_path, bytes)?;
-                    true
+                    match write_file_with_parent_dir(plot_path, bytes) {
+                        Ok(()) => true,
+                        Err(err) => {
+                            export_error = Some(err);
+                            false
+                        }
+                    }
                 } else {
                     false
                 }
             }
         };
 
-        if !written && cli.capture_plots {
+        if !written && export_error.is_none() && cli.capture_plots {
             eprintln!(
                 "wc-kernel: warning: script did not produce a {} plot; '{}' was not written",
                 plot_format_name(target_format),
@@ -433,6 +459,10 @@ fn run() -> Result<ExitCode, CliError> {
         if result.timed_out {
             eprintln!("wc-kernel: execution timed out after {} ms", cli.timeout_ms);
         }
+    }
+
+    if let Some(err) = export_error {
+        return Err(err);
     }
 
     if result.success {

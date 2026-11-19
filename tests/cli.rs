@@ -29,6 +29,17 @@ impl Drop for TestDir {
     }
 }
 
+fn python_has_matplotlib() -> bool {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+        return false;
+    }
+    Command::new(binary_path())
+        .args(["--lang", "py", "-e", "import matplotlib"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 #[test]
 fn cli_help_flag() {
     let output = Command::new(binary_path())
@@ -331,6 +342,94 @@ fn cli_large_stdout_does_not_deadlock() {
         output.stdout.len() >= 1_000_000,
         "large stdout must be drained without truncation"
     );
+}
+
+#[test]
+fn cli_defaults_to_current_directory() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+        eprintln!("Skipping Python test: python3 not found");
+        return;
+    }
+
+    let output = Command::new(binary_path())
+        .args([
+            "--lang",
+            "py",
+            "-e",
+            "import os; print(os.path.realpath(os.getcwd()))",
+        ])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert!(output.status.success());
+    let printed = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let printed = fs::canonicalize(printed).expect("canonical printed dir");
+    let expected = fs::canonicalize(std::env::current_dir().expect("current dir"))
+        .expect("canonical current dir");
+    assert_eq!(printed, expected);
+}
+
+#[test]
+fn cli_file_execution_resolves_sibling_imports() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+        eprintln!("Skipping Python test: python3 not found");
+        return;
+    }
+
+    let temp_dir = TestDir::new("wc-sibling-import");
+    fs::write(temp_dir.join("helper_module.py"), "VALUE = 42\n").expect("write helper module");
+    let script_file = temp_dir.join("main_script.py");
+    fs::write(
+        &script_file,
+        "import helper_module\nprint(helper_module.VALUE)\n",
+    )
+    .expect("write main script");
+
+    let output = Command::new(binary_path())
+        .args([
+            "--file",
+            script_file.to_str().expect("valid path"),
+            "--no-plot",
+        ])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+}
+
+#[test]
+fn cli_export_error_still_emits_json() {
+    if !python_has_matplotlib() {
+        eprintln!("Skipping plot export test: matplotlib not found");
+        return;
+    }
+
+    let temp_dir = TestDir::new("wc-export-error");
+    let blocker = temp_dir.join("blocker");
+    fs::write(&blocker, "not a directory").expect("write blocker file");
+    let plot_file = blocker.join("plot.png");
+
+    let output = Command::new(binary_path())
+        .args([
+            "--lang",
+            "py",
+            "-e",
+            "import matplotlib.pyplot as plt\nplt.plot([1, 2, 3])",
+            "--json",
+            "--out-plot",
+            plot_file.to_str().expect("valid path"),
+        ])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("result JSON must be emitted before the export error");
+    assert_eq!(json["success"], true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to create directory"));
 }
 
 #[test]
