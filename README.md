@@ -79,6 +79,36 @@ fn main() {
 
 ---
 
+## Tabular data capture
+
+Scripts that return a data frame or matrix fill `ExecutionResult::tables` with `TabularOutput`
+values (`headers` plus a list of text rows), ready to be inserted as native tables:
+
+- **R:** every visible top-level `data.frame` or `matrix` is captured, so `anova(fit)` keeps its
+  term names as a leading column.
+- **Python:** the final expression is captured when it evaluates to a `pandas.DataFrame`.
+- **Explicit helper:** call `wc_table(df)` in either language for a value that is not
+  the script's last expression (accepts `data.frame` or `matrix` in R, `pandas.DataFrame` in Python).
+
+```rust
+let code = r#"
+data.frame(species = c("Sp1", "Sp2"), abundance = c(10, 25))
+"#;
+
+if let Ok(result) = execute(&ExecutionRequest::new(CodeLanguage::R, code)) {
+    if let Some(table) = result.tables.first() {
+        println!("headers: {:?}", table.headers);
+        println!("first row: {:?}", table.rows.first());
+    }
+}
+```
+
+Both writers are bounded: at most 16 tables per run, 10,000 rows and 256 columns per
+table, 4,096 characters per cell, and 250,000 total cells. A malformed or oversized payload
+yields no tables instead of an error.
+
+---
+
 ## Testing
 
 Run automated tests:
