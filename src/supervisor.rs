@@ -21,6 +21,8 @@ const MAX_SUPERVISED_CHILDREN: usize = 65_536;
 #[cfg(target_os = "linux")]
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+
 struct CaptureSink {
     bytes: Arc<Mutex<Vec<u8>>>,
     truncated: Arc<AtomicBool>,
@@ -52,6 +54,7 @@ struct WaitOutcome {
     status: Option<ExitStatus>,
     timed_out: bool,
     output_limited: bool,
+    interrupted: bool,
 }
 
 enum ManagedChild {
@@ -101,8 +104,11 @@ impl ManagedChild {
         match self {
             #[cfg(unix)]
             Self::Unix(child) => child.try_wait(),
+            // Poll the leader only: `GroupChild::try_wait` also drains the job
+            // completion port, and cleanup needs its notification to wait for
+            // the job's workers afterwards.
             #[cfg(windows)]
-            Self::Windows(child) => child.try_wait(),
+            Self::Windows(child) => child.inner().try_wait(),
             #[cfg(not(any(unix, windows)))]
             Self::Other(child) => child.try_wait(),
         }
@@ -151,12 +157,18 @@ pub fn run() -> io::Result<()> {
     let binary = next_path(&mut args, "interpreter path")?;
     let script = next_path(&mut args, "script path")?;
     let result_file = next_path(&mut args, "result path")?;
+    let interpreter_pid_file = next_path(&mut args, "interpreter pid path")?;
     let timeout_ms = args
         .next()
         .and_then(|arg| arg.into_string().ok())
         .and_then(|arg| arg.parse::<u64>().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid timeout"))?;
     let interpreter_args = args.collect::<Vec<_>>();
+
+    ctrlc::set_handler(|| {
+        CANCELLED.store(true, Ordering::Release);
+    })
+    .map_err(|error| io::Error::other(format!("install termination handler: {error}")))?;
 
     #[cfg(target_os = "linux")]
     nix::sys::prctl::set_child_subreaper(true)
@@ -165,8 +177,10 @@ pub fn run() -> io::Result<()> {
     let result = execute_child(
         &binary,
         &script,
+        &interpreter_pid_file,
         &interpreter_args,
         Duration::from_millis(timeout_ms),
+        &CANCELLED,
     )
     .map_err(|error| io::Error::other(format!("supervise interpreter: {error}")))?;
     write_result(&result_file, result)
@@ -188,11 +202,27 @@ struct SupervisorResult {
     duration_ms: u64,
 }
 
+/// Record the interpreter PID so a watchdog can still reach its process group
+/// if this supervisor is killed before it finishes cleanup.
+fn write_interpreter_pid(path: &Path, pid: u32) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    writeln!(file, "{pid}")
+}
+
 fn execute_child(
     binary: &Path,
     script: &Path,
+    interpreter_pid_file: &Path,
     interpreter_args: &[OsString],
     timeout: Duration,
+    cancelled: &AtomicBool,
 ) -> io::Result<SupervisorResult> {
     let mut command = Command::new(binary);
     command
@@ -206,6 +236,14 @@ fn execute_child(
     let mut child = spawn_child(&mut command)
         .map_err(|error| io::Error::other(format!("spawn interpreter: {error}")))?;
     let child_pid = child.id();
+
+    if let Err(error) = write_interpreter_pid(interpreter_pid_file, child_pid) {
+        return Err(cleanup_after_failure(
+            io::Error::other(format!("record interpreter pid: {error}")),
+            cleanup_process_tree(&mut child, child_pid, false),
+            None,
+        ));
+    }
 
     let stdout_pipe = child.take_stdout();
     let stderr_pipe = child.take_stderr();
@@ -249,7 +287,7 @@ fn execute_child(
             }
         };
 
-    let outcome = wait_with_timeout(&mut child, timeout, &stdout_sink, &stderr_sink)
+    let outcome = wait_with_timeout(&mut child, timeout, &stdout_sink, &stderr_sink, cancelled)
         .map_err(|error| io::Error::other(format!("wait for interpreter: {error}")));
     let child_reaped = outcome
         .as_ref()
@@ -264,6 +302,13 @@ fn execute_child(
     process_cleanup?;
     stdout_cleanup?;
     stderr_cleanup?;
+
+    if outcome.interrupted {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "interpreter execution was cancelled",
+        ));
+    }
 
     let stdout = stdout_sink
         .bytes
@@ -382,6 +427,7 @@ fn wait_with_timeout(
     timeout: Duration,
     stdout_sink: &CaptureSink,
     stderr_sink: &CaptureSink,
+    cancelled: &AtomicBool,
 ) -> io::Result<WaitOutcome> {
     let start = Instant::now();
     loop {
@@ -390,6 +436,15 @@ fn wait_with_timeout(
                 status: Some(status),
                 timed_out: false,
                 output_limited: false,
+                interrupted: false,
+            });
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(WaitOutcome {
+                status: None,
+                timed_out: false,
+                output_limited: stdout_sink.is_truncated() || stderr_sink.is_truncated(),
+                interrupted: true,
             });
         }
         if start.elapsed() >= timeout {
@@ -397,6 +452,7 @@ fn wait_with_timeout(
                 status: None,
                 timed_out: true,
                 output_limited: stdout_sink.is_truncated() || stderr_sink.is_truncated(),
+                interrupted: false,
             });
         }
         if stdout_sink.is_truncated() || stderr_sink.is_truncated() {
@@ -404,6 +460,7 @@ fn wait_with_timeout(
                 status: child.try_wait()?,
                 timed_out: false,
                 output_limited: true,
+                interrupted: false,
             });
         }
         thread::sleep(Duration::from_millis(10));
@@ -415,9 +472,12 @@ fn terminate_process_group(
     _child_pid: u32,
     already_reaped: bool,
 ) -> io::Result<()> {
-    let reaped = already_reaped || child.try_wait()?.is_some();
+    // Never reap the leader before signalling its group: once the leader is
+    // reaped its PID (and therefore the PGID) can be reused by an unrelated
+    // process. `already_reaped` only reports a leader the wait loop already
+    // collected; otherwise the signal goes out first and `wait` reaps after.
     #[cfg(target_os = "linux")]
-    let group_kill = if reaped {
+    let group_kill = if already_reaped {
         Ok(())
     } else {
         match child {
@@ -425,7 +485,9 @@ fn terminate_process_group(
         }
     };
     #[cfg(all(unix, not(target_os = "linux")))]
-    let group_kill = {
+    let group_kill = if already_reaped {
+        Ok(())
+    } else {
         use nix::sys::signal::{Signal, killpg};
         use nix::unistd::Pid;
 
@@ -442,7 +504,7 @@ fn terminate_process_group(
         match child {
             ManagedChild::Windows(child) => match child.kill() {
                 Ok(()) => Ok(()),
-                Err(error) if reaped && error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) if already_reaped && error.kind() == io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(error),
             },
         }
@@ -452,7 +514,17 @@ fn terminate_process_group(
         ManagedChild::Other(child) => child.kill(),
     };
 
-    let wait = if reaped {
+    // `TerminateJobObject` is asynchronous, and `ManagedChild::try_wait` only
+    // polls the leader, so the job notification is still pending here and
+    // `wait` returns once every job member has exited.
+    #[cfg(windows)]
+    let wait = if already_reaped && group_kill.is_err() {
+        Ok(())
+    } else {
+        child.wait().map(|_| ())
+    };
+    #[cfg(not(windows))]
+    let wait = if already_reaped {
         Ok(())
     } else {
         child.wait().map(|_| ())

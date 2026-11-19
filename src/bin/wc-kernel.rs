@@ -19,6 +19,8 @@ use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use wordcraft_kernel::{
     CodeLanguage, ExecutionRequest, KernelError, PlotFormat, execute_with_cancellation,
@@ -61,6 +63,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 enum CliError {
     Usage(String),
     Runtime(String),
+    BrokenPipe,
 }
 
 #[derive(Debug, Default)]
@@ -169,6 +172,69 @@ fn set_file_path(cli: &mut CliArgs, path: PathBuf) -> Result<(), CliError> {
     Ok(())
 }
 
+fn output_error(error: io::Error) -> CliError {
+    if error.kind() == io::ErrorKind::BrokenPipe {
+        CliError::BrokenPipe
+    } else {
+        CliError::Runtime(format!("failed to write output: {error}"))
+    }
+}
+
+fn write_stdout(text: &str) -> Result<(), CliError> {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(text.as_bytes())
+        .and_then(|()| handle.flush())
+        .map_err(output_error)
+}
+
+fn write_stderr(text: &str) -> Result<(), CliError> {
+    let stderr = io::stderr();
+    let mut handle = stderr.lock();
+    handle
+        .write_all(text.as_bytes())
+        .and_then(|()| handle.flush())
+        .map_err(output_error)
+}
+
+/// Read all of stdin while staying responsive to cancellation.
+///
+/// The blocking read lives in a helper thread because the installed signal
+/// handler restarts interrupted reads. `None` reports a cancelled run.
+fn read_stdin(cancelled: &AtomicBool) -> Result<Option<String>, CliError> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("wc-kernel-stdin".to_string())
+        .spawn(move || {
+            let mut buffer = String::new();
+            let result = io::stdin().read_to_string(&mut buffer).map(|_| buffer);
+            let _ = sender.send(result);
+        })
+        .map_err(|error| CliError::Runtime(format!("failed to read from stdin: {error}")))?;
+
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(25)) {
+            Ok(Ok(text)) => return Ok(Some(text)),
+            Ok(Err(error)) => {
+                return Err(CliError::Runtime(format!(
+                    "failed to read from stdin: {error}"
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if cancelled.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(CliError::Runtime(
+                    "failed to read from stdin: reader stopped".to_string(),
+                ));
+            }
+        }
+    }
+}
+
 fn parse_args<I, S>(args: I) -> Result<Option<CliArgs>, CliError>
 where
     I: Iterator<Item = S>,
@@ -211,10 +277,10 @@ where
             continue;
         };
         if arg == "-h" || arg == "--help" {
-            print!("{USAGE}");
+            write_stdout(USAGE)?;
             return Ok(None);
         } else if arg == "-V" || arg == "--version" {
-            println!("wc-kernel {VERSION}");
+            write_stdout(&format!("wc-kernel {VERSION}\n"))?;
             return Ok(None);
         } else if arg == "--json" {
             cli.json = true;
@@ -394,11 +460,10 @@ fn run(cancelled: &AtomicBool) -> Result<ExitCode, CliError> {
             ));
         }
         if path.as_os_str() == "-" {
-            let mut buf = String::new();
-            io::stdin()
-                .read_to_string(&mut buf)
-                .map_err(|e| CliError::Runtime(format!("failed to read from stdin: {e}")))?;
-            (buf, None, None)
+            let Some(text) = read_stdin(cancelled)? else {
+                return Ok(ExitCode::from(130));
+            };
+            (text, None, None)
         } else {
             let content = fs::read_to_string(path).map_err(|e| {
                 CliError::Runtime(format!("failed to read file '{}': {e}", path.display()))
@@ -410,11 +475,10 @@ fn run(cancelled: &AtomicBool) -> Result<ExitCode, CliError> {
             (content, inferred, source_dir)
         }
     } else if cli.read_stdin || !io::stdin().is_terminal() {
-        let mut buf = String::new();
-        io::stdin()
-            .read_to_string(&mut buf)
-            .map_err(|e| CliError::Runtime(format!("failed to read from stdin: {e}")))?;
-        (buf, None, None)
+        let Some(text) = read_stdin(cancelled)? else {
+            return Ok(ExitCode::from(130));
+        };
+        (text, None, None)
     } else {
         return Err(CliError::Usage(
             "no code provided. Specify -e <code>, --file <path>, or pipe via stdin".to_string(),
@@ -516,36 +580,37 @@ fn run(cancelled: &AtomicBool) -> Result<ExitCode, CliError> {
         };
 
         if !written && export_error.is_none() && cli.capture_plots {
-            eprintln!(
-                "wc-kernel: warning: script did not produce a {} plot; '{}' was not written",
+            write_stderr(&format!(
+                "wc-kernel: warning: script did not produce a {} plot; '{}' was not written\n",
                 plot_format_name(target_format),
                 plot_path.display(),
-            );
+            ))?;
         }
     }
 
     if cli.json {
         let json_str = serde_json::to_string_pretty(&result)
             .map_err(|e| CliError::Runtime(format!("failed to serialize JSON output: {e}")))?;
-        println!("{json_str}");
+        write_stdout(&format!("{json_str}\n"))?;
     } else {
         if !result.stdout.is_empty() {
-            print!("{}", result.stdout);
-            let _ = io::stdout().flush();
+            write_stdout(&result.stdout)?;
         }
         if !result.stderr.is_empty() {
-            eprint!("{}", result.stderr);
-            let _ = io::stderr().flush();
+            write_stderr(&result.stderr)?;
         }
         if result.timed_out {
-            eprintln!("wc-kernel: execution timed out after {} ms", cli.timeout_ms);
+            write_stderr(&format!(
+                "wc-kernel: execution timed out after {} ms\n",
+                cli.timeout_ms
+            ))?;
         }
     }
 
     if result.output_truncated {
-        eprintln!(
-            "wc-kernel: warning: output exceeded the capture limit; captured output was truncated"
-        );
+        write_stderr(
+            "wc-kernel: warning: output exceeded the capture limit; captured output was truncated\n",
+        )?;
     }
 
     if let Some(err) = export_error {
@@ -588,21 +653,27 @@ fn main() -> ExitCode {
     let cancelled = Arc::new(AtomicBool::new(false));
     let signal_flag = Arc::clone(&cancelled);
     if let Err(error) = ctrlc::set_handler(move || signal_flag.store(true, Ordering::Release)) {
-        eprintln!("wc-kernel: error: failed to install Ctrl-C handler: {error}");
+        let _ = writeln!(
+            io::stderr(),
+            "wc-kernel: error: failed to install the interrupt handler: {error}"
+        );
         return ExitCode::FAILURE;
     }
 
     match run(&cancelled) {
         Ok(code) => code,
         Err(CliError::Usage(msg)) => {
-            eprintln!("wc-kernel: error: {msg}");
-            eprintln!("Try 'wc-kernel --help' for more information.");
+            let mut stderr = io::stderr();
+            let _ = writeln!(stderr, "wc-kernel: error: {msg}");
+            let _ = writeln!(stderr, "Try 'wc-kernel --help' for more information.");
             ExitCode::from(2)
         }
         Err(CliError::Runtime(msg)) => {
-            eprintln!("wc-kernel: error: {msg}");
+            let _ = writeln!(io::stderr(), "wc-kernel: error: {msg}");
             ExitCode::from(1)
         }
+        // A closed pipe is the reader's choice, not an execution failure.
+        Err(CliError::BrokenPipe) => ExitCode::SUCCESS,
     }
 }
 

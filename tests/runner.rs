@@ -76,6 +76,27 @@ fn relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
     Some(relative)
 }
 
+#[cfg(target_os = "linux")]
+fn assert_process_is_gone(pid: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => return,
+            // A zombie no longer runs; the environment may not reap orphans.
+            Ok(stat) if stat.split_whitespace().nth(2) == Some("Z") => return,
+            Ok(_) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = Command::new("kill")
+                .args(["-KILL", pid])
+                .stderr(Stdio::null())
+                .status();
+            panic!("descendant {pid} outlived the supervisor cleanup");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn python_basic_execution() {
     if !is_language_available(CodeLanguage::Python) {
@@ -253,7 +274,7 @@ fn forced_supervisor_termination_kills_its_process_group() {
     let helper = temp_dir.path().join("stalled-supervisor");
     fs::write(
         &helper,
-        "#!/bin/sh\n(: > child.ready; sleep 6; : > child.survived) &\nwhile [ ! -f child.ready ]; do sleep 0.01; done\nsleep 9\nwait\n",
+        "#!/bin/sh\ntrap '' TERM\nsleep 60 &\nchild=$!\necho \"$child\" > child.pid\n: > child.ready\nsleep 60\nwait\n",
     )
     .expect("write stalled helper");
     let mut permissions = fs::metadata(&helper)
@@ -273,16 +294,61 @@ fn forced_supervisor_termination_kills_its_process_group() {
         temp_dir.path().join("child.ready").is_file(),
         "fake supervisor did not start its descendant"
     );
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    let child_pid = fs::read_to_string(temp_dir.path().join("child.pid"))
+        .expect("read helper child pid")
+        .trim()
+        .to_string();
+    assert_process_is_gone(&child_pid);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cancellation_lets_the_supervisor_clean_up_before_the_hard_fallback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = TempTestDir::create("wc-supervisor-cancel");
+    let helper = temp_dir.path().join("cancelling-supervisor");
+    fs::write(
+        &helper,
+        "#!/bin/sh\ntrap 'echo term > term.received; kill -KILL \"$child\"; wait \"$child\" 2>/dev/null; exit 0' TERM\nsleep 60 &\nchild=$!\necho \"$child\" > child.pid\nwhile :; do sleep 0.05; done\n",
+    )
+    .expect("write cancelling helper");
+    let mut permissions = fs::metadata(&helper)
+        .expect("read helper metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&helper, permissions).expect("make helper executable");
+
+    let request = ExecutionRequest::new(CodeLanguage::Python, "")
+        .with_supervisor_path(&helper)
+        .with_working_dir(temp_dir.path())
+        .with_timeout(50)
+        .with_plot_capture(false);
+    let started = std::time::Instant::now();
+    assert!(execute(&request).is_err());
+
+    // The supervisor deadline is the request timeout plus five seconds, and a
+    // cooperative cancellation must finish before the four-second grace that
+    // leads to the hard fallback.
+    assert!(started.elapsed() < std::time::Duration::from_secs(7));
     assert!(
-        !temp_dir.path().join("child.survived").exists(),
-        "descendant survived forced supervisor termination"
+        temp_dir.path().join("term.received").is_file(),
+        "the supervisor was not asked to cancel its interpreter"
     );
+    let child_pid = fs::read_to_string(temp_dir.path().join("child.pid"))
+        .expect("read helper child pid")
+        .trim()
+        .to_string();
+    assert_process_is_gone(&child_pid);
 }
 
 #[cfg(unix)]
 #[test]
 fn supervisor_diagnostics_do_not_wait_for_inherited_stderr() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
     let temp_dir = TempTestDir::create("wc-supervisor-stderr");
     let helper = temp_dir.path().join("helper.sh");
     fs::write(&helper, "#!/bin/sh\nsleep 3 &\nexit 0\n").expect("write helper");
@@ -298,7 +364,13 @@ fn supervisor_diagnostics_do_not_wait_for_inherited_stderr() {
         .with_supervisor_path(&helper)
         .with_plot_capture(false);
     let started = std::time::Instant::now();
-    assert!(execute(&request).is_err());
+    match execute(&request) {
+        Err(KernelError::Io(message)) => assert!(
+            message.contains("read supervisor result"),
+            "expected a missing supervisor result, got: {message}"
+        ),
+        other => panic!("expected a missing supervisor result, got: {other:?}"),
+    }
     assert!(
         started.elapsed() < std::time::Duration::from_secs(2),
         "reading supervisor diagnostics waited for the inherited stderr handle"
@@ -360,6 +432,57 @@ fn python_path_is_used_for_module_lookup() {
 
     assert!(result.success);
     assert_eq!(result.stdout.trim(), "42");
+}
+
+#[test]
+fn python_path_cannot_shadow_wrapper_imports() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    let helper_dir = TempTestDir::create("wc-python-shadow");
+    fs::write(helper_dir.path().join("helper_module.py"), "VALUE = 42\n")
+        .expect("write helper module");
+    fs::write(
+        helper_dir.path().join("ast.py"),
+        "raise RuntimeError('shadowed ast imported')\n",
+    )
+    .expect("write ast shadow");
+    fs::write(
+        helper_dir.path().join("json.py"),
+        "raise RuntimeError('shadowed json imported')\n",
+    )
+    .expect("write json shadow");
+
+    let req = ExecutionRequest::new(
+        CodeLanguage::Python,
+        "import helper_module\nprint(helper_module.VALUE)",
+    )
+    .with_python_path(helper_dir.path());
+    let result = execute(&req).expect("execution failed");
+
+    assert!(result.success, "{}", result.stderr);
+    assert_eq!(result.stdout.trim(), "42");
+}
+
+#[test]
+fn python_invalid_utf8_output_respects_the_byte_limit() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    let code =
+        "import sys\nsys.stdout.buffer.write(b'\\xff' * (9 * 1024 * 1024))\nsys.stdout.flush()";
+    let result =
+        execute(&ExecutionRequest::new(CodeLanguage::Python, code).with_plot_capture(false))
+            .expect("execution failed");
+
+    assert!(result.output_truncated);
+    assert!(
+        result.stdout.len() <= MAX_CAPTURE_BYTES,
+        "decoded stdout exceeded the limit: {} bytes",
+        result.stdout.len()
+    );
 }
 
 #[test]

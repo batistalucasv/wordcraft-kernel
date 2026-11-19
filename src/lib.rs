@@ -32,6 +32,13 @@ static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Maximum bytes kept from each captured stream (stdout and stderr).
 const MAX_CAPTURE_BYTES: usize = 10 * 1024 * 1024;
 
+/// Pid record the supervisor writes before it starts the interpreter.
+const INTERPRETER_PID_FILE: &str = "__wordcraft_interpreter__.pid";
+
+/// How long the supervisor gets to cancel the interpreter before it is killed.
+#[cfg(unix)]
+const SUPERVISOR_CLEANUP_GRACE: Duration = Duration::from_secs(4);
+
 /// Programming language for a code chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -355,6 +362,11 @@ pub fn execute_with_cancellation(
             language: request.language,
             binary: request.language.binary_name(),
         })?;
+    // `--cwd` changes the supervisor's working directory, so a relative PATH
+    // entry must be resolved against this process before it is handed over.
+    let binary = std::path::absolute(&binary).map_err(|error| {
+        KernelError::Io(format!("resolve interpreter {}: {error}", binary.display()))
+    })?;
 
     let mut temp_dir = std::env::temp_dir();
     let mut created = false;
@@ -403,8 +415,11 @@ pub fn execute_with_cancellation(
             .map(|path| python_path_expression(path))
             .collect::<Result<Vec<_>, _>>()?;
         let paths_literal = format!("[{}]", paths.join(","));
+        // Import the wrapper's standard-library dependencies before the user
+        // search paths are inserted, so a sibling `ast.py` or `json.py` cannot
+        // replace them. They stay cached for the wrapper's own imports.
         wrapped_code = format!(
-            "(lambda _wc_sys, _wc_paths: [_wc_sys.path.insert(0, _wc_path) for _wc_path in reversed(_wc_paths)])(__import__('sys'), {paths_literal})\n{wrapped_code}"
+            "(lambda _wc_sys, _wc_ast, _wc_json, _wc_paths: [_wc_sys.path.insert(0, _wc_path) for _wc_path in reversed(_wc_paths)])(__import__('sys'), __import__('ast'), __import__('json'), {paths_literal})\n{wrapped_code}"
         );
     }
     fs::write(&script_file, wrapped_code.as_bytes()).map_err(|e| {
@@ -413,12 +428,14 @@ pub fn execute_with_cancellation(
 
     let supervisor = find_supervisor_binary(request.supervisor_path.as_deref())?;
     let result_file = temp_dir.join("__wordcraft_result__.bin");
+    let interpreter_pid_file = temp_dir.join(INTERPRETER_PID_FILE);
     let supervisor_stderr_path = temp_dir.join("__wordcraft_supervisor_stderr__.log");
     let mut cmd = Command::new(&supervisor);
     cmd.arg("--run")
         .arg(&binary)
         .arg(&script_file)
         .arg(&result_file)
+        .arg(&interpreter_pid_file)
         .arg(request.timeout_ms.to_string());
     if request.language == CodeLanguage::R {
         cmd.env("WORDCRAFT_USER_SCRIPT", &user_file)
@@ -456,7 +473,7 @@ pub fn execute_with_cancellation(
     let status = match wait_for_supervisor(&mut child, supervisor_timeout, cancelled) {
         Ok(status) => status,
         Err(error) => {
-            let cleanup = terminate_supervisor_process_group(&mut child);
+            let cleanup = terminate_supervisor_process_tree(&mut child, &interpreter_pid_file);
             if error.kind() == std::io::ErrorKind::Interrupted {
                 cleanup.map_err(|cleanup| {
                     KernelError::Io(format!("execution interrupted; cleanup failed: {cleanup}"))
@@ -496,9 +513,16 @@ pub fn execute_with_cancellation(
     }
     let outcome = read_supervisor_result(&result_file)
         .map_err(|e| KernelError::Io(format!("read supervisor result: {e}")))?;
-    let stdout = outcome.stdout;
-    let stderr = outcome.stderr;
-    let output_truncated = outcome.output_truncated;
+    let mut stdout = outcome.stdout;
+    let mut stderr = outcome.stderr;
+    let mut output_truncated = outcome.output_truncated;
+    // Invalid bytes expand to three bytes each once they are decoded, so the
+    // byte limit checked on the wire is not the limit of the returned strings.
+    let stdout_truncated = truncate_output(&mut stdout, MAX_CAPTURE_BYTES);
+    let stderr_truncated = truncate_output(&mut stderr, MAX_CAPTURE_BYTES);
+    if stdout_truncated || stderr_truncated {
+        output_truncated = true;
+    }
 
     let mut plot_png = None;
     if request.capture_plots && plot_format.captures_png() && plot_png_path.is_file() {
@@ -669,7 +693,55 @@ fn wait_for_supervisor(
     }
 }
 
-fn terminate_supervisor_process_group(child: &mut GroupChild) -> std::io::Result<()> {
+fn terminate_supervisor_process_tree(
+    child: &mut GroupChild,
+    interpreter_pid_file: &Path,
+) -> std::io::Result<()> {
+    // Ask the supervisor to stop the interpreter and its workers itself, so it
+    // can run its own cleanup before it exits.
+    #[cfg(unix)]
+    {
+        use nix::errno::Errno;
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+
+        let signalled = i32::try_from(child.id()).is_ok_and(|pid| {
+            matches!(
+                kill(Pid::from_raw(pid), Signal::SIGTERM),
+                Ok(()) | Err(Errno::ESRCH)
+            )
+        });
+        if signalled {
+            let deadline = Instant::now() + SUPERVISOR_CLEANUP_GRACE;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => return Ok(()),
+                    Ok(None) => {}
+                    Err(error) => return Err(error),
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    force_terminate_supervisor_process_group(child, interpreter_pid_file)
+}
+
+/// Hard fallback: the supervisor ignored the cancellation request.
+///
+/// The supervisor's own group covers the interpreter on Linux. Elsewhere the
+/// interpreter leads its own group, whose PID was recorded before it started.
+fn force_terminate_supervisor_process_group(
+    child: &mut GroupChild,
+    #[cfg_attr(not(all(unix, not(target_os = "linux"))), allow(unused_variables))]
+    interpreter_pid_file: &Path,
+) -> std::io::Result<()> {
+    #[cfg(all(unix, not(target_os = "linux")))]
+    kill_recorded_interpreter_group(interpreter_pid_file);
+
     match child.kill() {
         Ok(()) => child.wait().map(|_| ()),
         Err(kill_error) => match child.try_wait() {
@@ -680,6 +752,22 @@ fn terminate_supervisor_process_group(child: &mut GroupChild) -> std::io::Result
             ))),
         },
     }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn kill_recorded_interpreter_group(path: &Path) {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+
+    let Some(pid) = fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i32>().ok())
+    else {
+        return;
+    };
+    // The interpreter either still runs or is an unreaped zombie owned by the
+    // supervisor, so its group cannot have been recycled yet.
+    let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
 }
 
 fn create_private_file(path: &Path) -> std::io::Result<fs::File> {
@@ -774,6 +862,19 @@ fn read_supervisor_result(path: &Path) -> std::io::Result<SupervisorResult> {
 /// closing root element is required to avoid returning partial output.
 fn is_complete_svg(content: &str) -> bool {
     content.len() > 64 && content.contains("<svg") && content.trim_end().ends_with("</svg>")
+}
+
+/// Shorten `text` to at most `limit` bytes without splitting a character.
+fn truncate_output(text: &mut String, limit: usize) -> bool {
+    if text.len() <= limit {
+        return false;
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    true
 }
 
 /// Create an owner-only directory leaf exclusively.

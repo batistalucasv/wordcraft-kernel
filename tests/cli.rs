@@ -183,19 +183,42 @@ fn cli_python_eval_json() {
 }
 
 #[cfg(unix)]
-#[test]
-fn cli_ctrl_c_cleans_execution_workspace_and_supervisor() {
+fn assert_process_stopped(pid: &str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let running = Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !running {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = Command::new("kill")
+                .args(["-KILL", pid])
+                .stderr(Stdio::null())
+                .status();
+            panic!("interpreter {pid} survived cancellation");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn assert_signal_cleans_execution(signal: nix::sys::signal::Signal, prefix: &str) {
     if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
         return;
     }
 
-    let fixture = TestDir::new("wc-kernel-interrupt");
+    let fixture = TestDir::new(prefix);
     let working_dir = fixture.join("cwd");
     let scratch_dir = fixture.join("scratch");
     fs::create_dir(&working_dir).expect("create working directory");
     fs::create_dir(&scratch_dir).expect("create scratch directory");
 
-    let code = "from pathlib import Path\nimport time\nPath('started').touch()\ntime.sleep(3)";
+    let code = "from pathlib import Path\nimport os, time\nPath('interpreter.pid').write_text(str(os.getpid()))\ntime.sleep(30)";
     let mut child = Command::new(binary_path())
         .args(["--lang", "py", "--eval", code, "--cwd"])
         .arg(&working_dir)
@@ -206,9 +229,9 @@ fn cli_ctrl_c_cleans_execution_workspace_and_supervisor() {
         .spawn()
         .expect("spawn wc-kernel");
 
-    let started = working_dir.join("started");
+    let pid_file = working_dir.join("interpreter.pid");
     let startup_deadline = Instant::now() + Duration::from_secs(10);
-    while !started.is_file() {
+    while !pid_file.is_file() {
         if let Some(status) = child.try_wait().expect("check wc-kernel status") {
             panic!("wc-kernel exited before starting user code: {status}");
         }
@@ -218,6 +241,67 @@ fn cli_ctrl_c_cleans_execution_workspace_and_supervisor() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+    let interpreter_pid = fs::read_to_string(&pid_file).expect("read interpreter pid");
+    let interpreter_pid = interpreter_pid.trim().to_string();
+
+    let pid = i32::try_from(child.id()).expect("wc-kernel PID fits in i32");
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal).expect("signal wc-kernel");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("check wc-kernel status") {
+            break status;
+        }
+        if Instant::now() >= exit_deadline {
+            child.kill().expect("stop unresponsive wc-kernel");
+            let _ = child.wait();
+            panic!("wc-kernel did not exit after {signal:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    assert_eq!(status.code(), Some(130));
+    assert_eq!(
+        fs::read_dir(&scratch_dir)
+            .expect("read scratch directory")
+            .count(),
+        0,
+        "execution workspace was not cleaned up after {signal:?}"
+    );
+    assert_process_stopped(&interpreter_pid);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_ctrl_c_cleans_execution_workspace_and_supervisor() {
+    assert_signal_cleans_execution(nix::sys::signal::Signal::SIGINT, "wc-kernel-interrupt");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_sigterm_cleans_execution_workspace_and_supervisor() {
+    assert_signal_cleans_execution(nix::sys::signal::Signal::SIGTERM, "wc-kernel-terminate");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_ctrl_c_during_stdin_read_exits_without_running_code() {
+    let fixture = TestDir::new("wc-kernel-stdin-interrupt");
+    let scratch_dir = fixture.join("scratch");
+    fs::create_dir(&scratch_dir).expect("create scratch directory");
+
+    let mut child = Command::new(binary_path())
+        .args(["--lang", "py", "--stdin"])
+        .env("TMPDIR", &scratch_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn wc-kernel");
+
+    // Keep the write end open, so the CLI stays blocked on stdin.
+    let stdin = child.stdin.take().expect("stdin piped");
+    std::thread::sleep(Duration::from_millis(300));
 
     let pid = i32::try_from(child.id()).expect("wc-kernel PID fits in i32");
     nix::sys::signal::kill(
@@ -234,10 +318,11 @@ fn cli_ctrl_c_cleans_execution_workspace_and_supervisor() {
         if Instant::now() >= exit_deadline {
             child.kill().expect("stop unresponsive wc-kernel");
             let _ = child.wait();
-            panic!("wc-kernel did not exit after SIGINT");
+            panic!("wc-kernel did not stop reading stdin after SIGINT");
         }
         std::thread::sleep(Duration::from_millis(10));
     };
+    drop(stdin);
 
     assert_eq!(status.code(), Some(130));
     assert_eq!(
@@ -245,7 +330,76 @@ fn cli_ctrl_c_cleans_execution_workspace_and_supervisor() {
             .expect("read scratch directory")
             .count(),
         0,
-        "execution workspace was not cleaned up after SIGINT"
+        "no workspace should be created for cancelled stdin input"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_closed_stdout_pipe_does_not_panic() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+        return;
+    }
+
+    let mut child = Command::new(binary_path())
+        .args(["--lang", "py", "-e", "print('x' * 65536)", "--no-plot"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn wc-kernel");
+    drop(child.stdout.take().expect("stdout piped"));
+
+    let output = child.wait_with_output().expect("wait for wc-kernel");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "a closed output pipe must not fail the run: {stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_resolves_interpreter_before_changing_directory() {
+    let Some(python) = wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python)
+    else {
+        return;
+    };
+
+    let fixture = TestDir::new("wc-relative-interpreter");
+    let bin_dir = fixture.join("bin");
+    let working_dir = fixture.join("cwd");
+    fs::create_dir(&bin_dir).expect("create bin directory");
+    fs::create_dir(&working_dir).expect("create working directory");
+    std::os::unix::fs::symlink(
+        fs::canonicalize(python).expect("canonical python"),
+        bin_dir.join("python3"),
+    )
+    .expect("link python3 into the relative PATH entry");
+
+    let output = Command::new(binary_path())
+        .args([
+            "--lang",
+            "py",
+            "-e",
+            "print('relative path works')",
+            "--no-plot",
+            "--cwd",
+        ])
+        .arg(&working_dir)
+        .current_dir(&fixture.path)
+        .env("PATH", "bin")
+        .output()
+        .expect("execute wc-kernel");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "relative path works"
     );
 }
 
@@ -284,8 +438,7 @@ fn cli_file_execution_and_inference() {
         return;
     }
 
-    let temp_dir = std::env::temp_dir().join(format!("wc-test-{}", std::process::id()));
-    fs::create_dir_all(&temp_dir).expect("create temp dir");
+    let temp_dir = TestDir::new("wc-file-inference");
     let script_file = temp_dir.join("test_script.py");
     fs::write(&script_file, "print('inferred python works')").expect("write test script");
 
@@ -298,9 +451,6 @@ fn cli_file_execution_and_inference() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout.trim(), "inferred python works");
-
-    let _ = fs::remove_file(script_file);
-    let _ = fs::remove_dir(temp_dir);
 }
 
 #[test]
@@ -310,8 +460,7 @@ fn cli_out_plot_png_saved() {
         return;
     }
 
-    let temp_dir = std::env::temp_dir().join(format!("wc-plot-test-{}", std::process::id()));
-    fs::create_dir_all(&temp_dir).expect("create temp dir");
+    let temp_dir = TestDir::new("wc-plot");
     let plot_file = temp_dir.join("generated_plot.png");
 
     let output = Command::new(binary_path())
@@ -333,9 +482,6 @@ fn cli_out_plot_png_saved() {
         bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
         "file must be a valid PNG"
     );
-
-    let _ = fs::remove_file(plot_file);
-    let _ = fs::remove_dir(temp_dir);
 }
 
 #[test]
@@ -345,8 +491,7 @@ fn cli_out_plot_svg_saved() {
         return;
     }
 
-    let temp_dir = std::env::temp_dir().join(format!("wc-svg-test-{}", std::process::id()));
-    fs::create_dir_all(&temp_dir).expect("create temp dir");
+    let temp_dir = TestDir::new("wc-svg");
     let plot_file = temp_dir.join("generated_plot.svg");
 
     let output = Command::new(binary_path())
@@ -371,9 +516,6 @@ fn cli_out_plot_svg_saved() {
         content.contains("<svg") && content.contains("</svg>"),
         "file must be a valid SVG"
     );
-
-    let _ = fs::remove_file(plot_file);
-    let _ = fs::remove_dir(temp_dir);
 }
 
 #[test]
