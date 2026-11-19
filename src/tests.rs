@@ -234,10 +234,10 @@ fn workspace_guard_removes_the_directory_on_drop() {
     let path =
         std::env::temp_dir().join(format!("wordcraft-workspace-guard-{}", std::process::id()));
     std::fs::create_dir(&path).expect("create test workspace");
-    std::fs::write(path.join("payload.csv"), b"x").expect("write payload");
 
     {
         let workspace = ExecutionWorkspace { path: path.clone() };
+        std::fs::write(workspace.path().join("payload.csv"), b"x").expect("write payload");
         assert!(workspace.path().is_dir());
     }
 
