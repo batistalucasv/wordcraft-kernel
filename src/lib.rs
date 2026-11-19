@@ -289,6 +289,23 @@ fn create_execution_dir() -> Result<PathBuf, KernelError> {
     ))
 }
 
+/// An execution workspace removed when dropped, including error paths.
+struct ExecutionWorkspace {
+    path: PathBuf,
+}
+
+impl ExecutionWorkspace {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ExecutionWorkspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Execute a code chunk and collect outputs.
 pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelError> {
     let binary =
@@ -297,7 +314,10 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
             binary: request.language.binary_name(),
         })?;
 
-    let temp_dir = create_execution_dir()?;
+    let workspace = ExecutionWorkspace {
+        path: create_execution_dir()?,
+    };
+    let temp_dir = workspace.path();
 
     let plot_png_path = temp_dir.join("__wordcraft_plot__.png");
     let plot_svg_path = temp_dir.join("__wordcraft_plot__.svg");
@@ -324,7 +344,7 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     if let Some(ref dir) = request.working_dir {
         cmd.current_dir(dir);
     } else {
-        cmd.current_dir(&temp_dir);
+        cmd.current_dir(temp_dir);
     }
 
     let start_time = Instant::now();
@@ -363,11 +383,6 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
             .ok()
             .filter(|content| content.len() > 64 && content.contains("<svg"));
     }
-
-    // Best-effort cleanup of the execution-owned directory. Snippets may write
-    // extra files here (the ingestion template writes a CSV), so remove the
-    // whole tree; a caller-supplied working_dir is never touched.
-    let _ = fs::remove_dir_all(&temp_dir);
 
     let exit_code = exit_status.and_then(|s| s.code());
     let success = exit_status.map(|s| s.success()).unwrap_or(false) && !timed_out;

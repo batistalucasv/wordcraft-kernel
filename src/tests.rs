@@ -230,6 +230,21 @@ print(
 }
 
 #[test]
+fn workspace_guard_removes_the_directory_on_drop() {
+    let path =
+        std::env::temp_dir().join(format!("wordcraft-workspace-guard-{}", std::process::id()));
+    std::fs::create_dir(&path).expect("create test workspace");
+    std::fs::write(path.join("payload.csv"), b"x").expect("write payload");
+
+    {
+        let workspace = ExecutionWorkspace { path: path.clone() };
+        assert!(workspace.path().is_dir());
+    }
+
+    assert!(!path.exists(), "workspace survived the guard");
+}
+
+#[test]
 fn execution_directory_is_removed_after_execution() {
     if !is_language_available(CodeLanguage::Python) {
         return;
