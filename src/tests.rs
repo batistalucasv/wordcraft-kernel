@@ -694,8 +694,17 @@ print("done")
 
 #[test]
 fn table_payload_is_clamped_and_rectangular() {
-    let dir = std::env::temp_dir().join(format!("wordcraft-tables-unit-{}", std::process::id()));
-    fs::create_dir_all(&dir).expect("create scratch dir");
+    let unique_id = format!(
+        "wordcraft-tables-unit-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let dir = std::env::temp_dir().join(unique_id);
+    create_scratch_dir(&dir).expect("create scratch dir");
+    let _guard = TempDirGuard(&dir);
     let path = dir.join("tables.json");
 
     let long_cell = "x".repeat(MAX_CELL_CHARS + 10);
@@ -713,20 +722,25 @@ fn table_payload_is_clamped_and_rectangular() {
     assert_eq!(table.rows[1], vec!["1", "2"]);
     assert_eq!(table.rows[2][0].chars().count(), MAX_CELL_CHARS);
     assert_eq!(table.rows[2][1], "");
-
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn malformed_table_payload_is_ignored() {
-    let dir = std::env::temp_dir().join(format!("wordcraft-tables-bad-{}", std::process::id()));
-    fs::create_dir_all(&dir).expect("create scratch dir");
+    let unique_id = format!(
+        "wordcraft-tables-bad-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let dir = std::env::temp_dir().join(unique_id);
+    create_scratch_dir(&dir).expect("create scratch dir");
+    let _guard = TempDirGuard(&dir);
     let path = dir.join("tables.json");
     fs::write(&path, "not json at all").expect("write payload");
 
     assert!(read_tables(&path).is_empty());
-
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -1211,4 +1225,136 @@ df
     assert_eq!(res.tables.len(), 1);
     assert_eq!(res.tables[0].headers, vec!["status"]);
     assert_eq!(res.tables[0].rows, vec![vec!["ok"]]);
+}
+
+#[test]
+fn r_command_args_are_empty_and_tables_captured() {
+    if !is_language_available(CodeLanguage::R) {
+        return;
+    }
+
+    let code = r#"
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) != 0L) {
+    stop(paste("Expected 0 args, got", length(args)))
+}
+data.frame(status = "empty_args_ok")
+"#;
+    let req = ExecutionRequest::new(CodeLanguage::R, code);
+    let res = execute(&req).expect("execution should succeed");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert_eq!(res.tables.len(), 1);
+    assert_eq!(res.tables[0].headers, vec!["status"]);
+    assert_eq!(res.tables[0].rows, vec![vec!["empty_args_ok"]]);
+}
+
+#[test]
+fn r_compact_row_names_explicit_sequence_not_treated_as_labels() {
+    if !is_language_available(CodeLanguage::R) {
+        return;
+    }
+
+    let code = r#"
+df <- data.frame(val = 1:4)
+row.names(df) <- 1:4
+df
+"#;
+    let req = ExecutionRequest::new(CodeLanguage::R, code);
+    let res = execute(&req).expect("execution should succeed");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert_eq!(res.tables.len(), 1);
+    assert_eq!(res.tables[0].headers, vec!["val"]);
+    assert_eq!(
+        res.tables[0].rows,
+        vec![vec!["1"], vec!["2"], vec!["3"], vec!["4"]]
+    );
+}
+
+#[test]
+fn r_matrix_large_slice_bounds_before_copy() {
+    if !is_language_available(CodeLanguage::R) {
+        return;
+    }
+
+    let code = r#"
+mat <- matrix(1:30000, nrow = 100, ncol = 300)
+colnames(mat) <- paste0("c", 1:300)
+rownames(mat) <- paste0("r", 1:100)
+mat
+"#;
+    let req = ExecutionRequest::new(CodeLanguage::R, code);
+    let res = execute(&req).expect("execution should succeed");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert_eq!(res.tables.len(), 1);
+    let table = &res.tables[0];
+    assert_eq!(table.headers.len(), 256);
+    assert_eq!(table.headers[0], "");
+    assert_eq!(table.headers[1], "c1");
+    assert_eq!(table.headers[255], "c255");
+    assert_eq!(table.rows.len(), 100);
+    assert_eq!(table.rows[0].len(), 256);
+    assert_eq!(table.rows[0][0], "r1");
+}
+
+#[test]
+fn python_file_dunder_points_to_user_script() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    let code = r#"
+import sys
+from pathlib import Path
+file_name = Path(__file__).name
+argv_name = Path(sys.argv[0]).name
+assert file_name.startswith("user."), f"file is {file_name}"
+assert argv_name.startswith("user."), f"argv is {argv_name}"
+print("file_dunder_ok")
+"#;
+    let req = ExecutionRequest::new(CodeLanguage::Python, code);
+    let res = execute(&req).expect("execution should succeed");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert!(res.stdout.contains("file_dunder_ok"));
+}
+
+#[test]
+fn python_dataframe_index_only_no_data_columns_captured() {
+    if !pandas_available() {
+        return;
+    }
+
+    let code = r#"
+import pandas as pd
+pd.DataFrame(index=["site-a", "site-b"])
+"#;
+    let req = ExecutionRequest::new(CodeLanguage::Python, code);
+    let res = execute(&req).expect("execution should succeed");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert_eq!(res.tables.len(), 1);
+    assert_eq!(res.tables[0].headers, vec![""]);
+    assert_eq!(res.tables[0].rows, vec![vec!["site-a"], vec!["site-b"]]);
+}
+
+#[test]
+fn python_dataframe_256_columns_with_index_limited_to_256_slots() {
+    if !pandas_available() {
+        return;
+    }
+
+    let code = r#"
+import pandas as pd
+pd.DataFrame({f"c{i}": [1] for i in range(256)}, index=["row1"])
+"#;
+    let req = ExecutionRequest::new(CodeLanguage::Python, code);
+    let res = execute(&req).expect("execution should succeed");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert_eq!(res.tables.len(), 1);
+    let table = &res.tables[0];
+    assert_eq!(table.headers.len(), 256);
+    assert_eq!(table.headers[0], "");
+    assert_eq!(table.headers[1], "c0");
+    assert_eq!(table.headers[255], "c254");
+    assert_eq!(table.rows.len(), 1);
+    assert_eq!(table.rows[0].len(), 256);
+    assert_eq!(table.rows[0][0], "row1");
 }

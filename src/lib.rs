@@ -342,10 +342,20 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
 
     let mut cmd = Command::new(&binary);
     cmd.arg(&script_file);
-    cmd.arg(&user_file);
-    cmd.arg(&tables_file);
-    cmd.arg(&plot_png_path);
-    cmd.arg(&plot_svg_path);
+    match request.language {
+        CodeLanguage::R => {
+            cmd.env("WORDCRAFT_USER_SCRIPT", &user_file);
+            cmd.env("WORDCRAFT_TABLES_FILE", &tables_file);
+            cmd.env("WORDCRAFT_PLOT_PNG", &plot_png_path);
+            cmd.env("WORDCRAFT_PLOT_SVG", &plot_svg_path);
+        }
+        CodeLanguage::Python => {
+            cmd.arg(&user_file);
+            cmd.arg(&tables_file);
+            cmd.arg(&plot_png_path);
+            cmd.arg(&plot_svg_path);
+        }
+    }
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -750,13 +760,12 @@ struct RawTable {
 
 const R_TEMPLATE: &str = r##"options(warn = 1)
 local({
-  .wc_args <- commandArgs(trailingOnly = TRUE)
-  user_script <- .wc_args[1L]
-  plot_png <- .wc_args[3L]
-  plot_svg <- .wc_args[4L]
+  user_script <- Sys.getenv("WORDCRAFT_USER_SCRIPT")
+  plot_png <- Sys.getenv("WORDCRAFT_PLOT_PNG")
+  plot_svg <- Sys.getenv("WORDCRAFT_PLOT_SVG")
 
   driver <- new.env(parent = emptyenv())
-  driver$tables_file <- .wc_args[2L]
+  driver$tables_file <- Sys.getenv("WORDCRAFT_TABLES_FILE")
   driver$tables <- list()
 
   json_escape <- function(value) {
@@ -829,20 +838,6 @@ local({
     if (!is.data.frame(value) && !is.matrix(value)) {
       return(invisible(NULL))
     }
-    cols_count <- min(ncol(value), 256L)
-    if (cols_count == 0L) {
-      return(invisible(NULL))
-    }
-    raw_headers <- if (is.matrix(value)) colnames(value) else names(value)
-    df <- base::as.data.frame(value)
-    if (is.null(raw_headers) || length(raw_headers) < cols_count) {
-      raw_headers <- names(df)
-    }
-    if (is.null(raw_headers)) {
-      raw_headers <- rep("", cols_count)
-    }
-    headers <- raw_headers[seq_len(cols_count)]
-    headers <- vapply(headers, function(h) substr(as.character(h), 1L, 4096L), character(1), USE.NAMES = FALSE)
     count <- min(nrow(value), 10000L)
 
     has_labels <- FALSE
@@ -857,11 +852,35 @@ local({
     } else {
       if (.row_names_info(value, 1L) > 0L) {
         rn_df <- .row_names_info(value, 0L)
-        retained_labels <- as.character(rn_df[seq_len(count)])
-        has_labels <- !identical(retained_labels, as.character(seq_len(count)))
-        labels <- retained_labels
+        is_compact <- is.integer(rn_df) && length(rn_df) == 2L && is.na(rn_df[1L])
+        if (!is_compact) {
+          retained_labels <- as.character(rn_df[seq_len(count)])
+          has_labels <- !identical(retained_labels, as.character(seq_len(count)))
+          labels <- retained_labels
+        }
       }
     }
+
+    max_cols <- if (has_labels) 255L else 256L
+    cols_count <- min(ncol(value), max_cols)
+    if (cols_count == 0L && !has_labels) {
+      return(invisible(NULL))
+    }
+
+    raw_headers <- if (is.matrix(value)) colnames(value) else names(value)
+    df <- if (is.matrix(value)) {
+      base::as.data.frame(value[seq_len(count), seq_len(cols_count), drop = FALSE])
+    } else {
+      base::as.data.frame(value)
+    }
+    if (is.null(raw_headers) || length(raw_headers) < cols_count) {
+      raw_headers <- names(df)
+    }
+    if (is.null(raw_headers)) {
+      raw_headers <- rep("", cols_count)
+    }
+    headers <- raw_headers[seq_len(cols_count)]
+    headers <- vapply(headers, function(h) substr(as.character(h), 1L, 4096L), character(1), USE.NAMES = FALSE)
 
     if (has_labels) {
       headers <- c("", headers)
@@ -869,7 +888,11 @@ local({
     rows <- vector("list", count)
     df_sub <- df[seq_len(cols_count)]
     for (index in seq_len(count)) {
-      cells <- vapply(df_sub, function(column) cell(column[index]), character(1), USE.NAMES = FALSE)
+      cells <- if (cols_count > 0L) {
+        vapply(df_sub, function(column) cell(column[index]), character(1), USE.NAMES = FALSE)
+      } else {
+        character(0)
+      }
       if (has_labels) {
         cells <- c(cell(labels[index]), cells)
       }
@@ -971,6 +994,7 @@ _wc_plot_png_path = _wc_sys.argv[3]
 _wc_plot_svg_path = _wc_sys.argv[4]
 _wc_sys.argv = [_wc_user_path]
 _wc_globals = globals()
+_wc_globals["__file__"] = _wc_user_path
 _wc_tables = []
 
 try:
@@ -1005,13 +1029,16 @@ def _wc_capture(value):
             isinstance(value.index, _wc_pandas.RangeIndex)
             and value.index.equals(_wc_pandas.RangeIndex(len(value)))
         )
-        sliced = value.iloc[:10000, :256]
+        max_cols = 255 if has_labels else 256
+        sliced = value.iloc[:10000, :max_cols]
         raw_headers = [_wc_cell(col) for col in sliced.columns]
         headers = ([""] + raw_headers) if has_labels else raw_headers
+        if not headers:
+            return None
         rows = []
         if has_labels:
-            for idx_val, row in zip(sliced.index, sliced.itertuples(index=False, name=None)):
-                rows.append([_wc_cell(idx_val)] + [_wc_cell(c) for c in row])
+            for row in sliced.itertuples(index=True, name=None):
+                rows.append([_wc_cell(c) for c in row])
         else:
             for row in sliced.itertuples(index=False, name=None):
                 rows.append([_wc_cell(c) for c in row])
@@ -1079,6 +1106,7 @@ def _wc_run_user_code():
             value=tree.body[-1].value,
         )
         ast.fix_missing_locations(tree)
+    _wc_globals["__file__"] = _wc_user_path
     exec(compile(tree, _wc_user_path, "exec"), _wc_globals)
     return returns_last
 
