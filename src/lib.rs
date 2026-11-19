@@ -267,10 +267,10 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
         });
     }
 
-    // Best-effort cleanup of temporary files
-    let _ = fs::remove_file(&script_file);
-    let _ = fs::remove_file(&plot_file);
-    let _ = fs::remove_dir(&temp_dir);
+    // Best-effort cleanup of the execution-owned directory. Snippets may write
+    // extra files here (the ingestion template writes a CSV), so remove the
+    // whole tree; a caller-supplied working_dir is never touched.
+    let _ = fs::remove_dir_all(&temp_dir);
 
     let exit_code = exit_status.and_then(|s| s.code());
     let success = exit_status.map(|s| s.success()).unwrap_or(false) && !timed_out;

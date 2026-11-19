@@ -86,7 +86,7 @@ que já rodam com dados sintéticos:
 | `r.lm-confidence` | R | Regressão | `ggplot2` |
 | `r.ttest-anova` | R | Testes de hipótese | `ggplot2` |
 | `python.data-ingest` | Python | Ingestão de dados | `pandas` |
-| `python.correlation-heatmap` | Python | Correlação | `pandas`, `seaborn`, `matplotlib` |
+| `python.correlation-heatmap` | Python | Correlação | `pandas`, `seaborn`, `matplotlib`, `scipy` |
 | `python.lm-tests` | Python | Regressão | `numpy`, `pandas`, `scipy` |
 
 Navegue com `templates::all()`, `templates::find(id)`,

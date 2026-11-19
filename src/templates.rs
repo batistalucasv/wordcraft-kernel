@@ -113,7 +113,8 @@ pub struct Template {
     pub language: CodeLanguage,
     /// Topic used to group snippets.
     pub category: TemplateCategory,
-    /// Third-party packages the snippet imports, by package name.
+    /// Third-party packages the snippet needs, including packages used only by a
+    /// documented option (for example scipy for Kendall correlation).
     ///
     /// Tests run the snippet only when every listed package is installed.
     pub requires: &'static [&'static str],
@@ -281,7 +282,8 @@ community <- sapply(
 rownames(community) <- sprintf("unit_%02d", seq_len(n_units))
 colnames(community) <- sprintf("sp_%02d", seq_len(n_species))
 
-# Sample-based rarefaction (Mao's tau) with a 95% confidence envelope.
+# Randomised (permutation-based) species accumulation with a 95% confidence
+# envelope. Use method = "exact" instead to get Mao's tau estimator.
 accumulation <- specaccum(
   community,
   method = "random",
@@ -379,9 +381,9 @@ biomass <- data.frame(
   )
 )
 
-# Two-sample Student's t-test: Forest vs. Grassland.
+# Two-sample Student's t-test (pooled variance): Forest vs. Grassland.
 pair <- subset(biomass, habitat %in% c("Forest", "Grassland"))
-print(t.test(biomass ~ habitat, data = pair))
+print(t.test(biomass ~ habitat, data = pair, var.equal = TRUE))
 
 # One-way ANOVA across all three habitats, followed by Tukey's HSD.
 model <- aov(biomass ~ habitat, data = biomass)
@@ -571,7 +573,7 @@ static TEMPLATES: &[Template] = &[
     Template {
         id: "r.species-accumulation",
         title: "Species accumulation and rarefaction",
-        description: "Sample-based rarefaction curve with a confidence envelope.",
+        description: "Permutation-based species accumulation curve with a confidence envelope.",
         language: CodeLanguage::R,
         category: TemplateCategory::Accumulation,
         requires: &["vegan"],
@@ -696,7 +698,7 @@ static TEMPLATES: &[Template] = &[
         description: "Pearson correlations printed and drawn as a seaborn heat map.",
         language: CodeLanguage::Python,
         category: TemplateCategory::Correlation,
-        requires: &["pandas", "seaborn", "matplotlib"],
+        requires: &["pandas", "seaborn", "matplotlib", "scipy"],
         params: &[
             TemplateParam {
                 key: "seed",
@@ -714,7 +716,7 @@ static TEMPLATES: &[Template] = &[
                 key: "method",
                 label: "Correlation method",
                 default: "pearson",
-                description: "Correlation method passed to pandas: pearson, spearman or kendall.",
+                description: "Correlation method passed to pandas: pearson, spearman or kendall (Kendall needs scipy).",
             },
             TemplateParam {
                 key: "title",

@@ -3,7 +3,9 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use crate::templates::{self, Template, TemplateCategory, TemplateParam};
-use crate::{CodeLanguage, KernelError, execute, is_language_available, which_binary};
+use crate::{
+    CodeLanguage, ExecutionRequest, KernelError, execute, is_language_available, which_binary,
+};
 
 const NO_PARAMS: &[TemplateParam] = &[];
 const SELF_REFERENTIAL_PARAMS: &[TemplateParam] = &[TemplateParam {
@@ -317,10 +319,21 @@ fn hostile_parameters_never_panic() {
     }
 }
 
-/// Parse a rendered script without executing it. `None` means the interpreter
-/// is not installed, so the check is skipped rather than failed.
-fn syntax_is_valid(template: &Template, source: &str) -> Option<bool> {
-    let binary = which_binary(template.language)?;
+/// Result of parsing a rendered script without executing it.
+enum SyntaxCheck {
+    /// The interpreter is not installed, so the check is skipped.
+    Skipped,
+    /// The interpreter parsed the source.
+    Valid,
+    /// The interpreter could not parse it, or the subprocess failed.
+    Invalid(String),
+}
+
+/// Parse a rendered script without executing it.
+fn syntax_is_valid(template: &Template, source: &str) -> SyntaxCheck {
+    let Some(binary) = which_binary(template.language) else {
+        return SyntaxCheck::Skipped;
+    };
     let mut command = Command::new(binary);
     match template.language {
         CodeLanguage::R => {
@@ -339,19 +352,20 @@ fn syntax_is_valid(template: &Template, source: &str) -> Option<bool> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
-    let mut child = command.spawn().ok()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(source.as_bytes()).ok()?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return SyntaxCheck::Invalid(format!("spawn failed: {error}")),
+    };
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(error) = stdin.write_all(source.as_bytes())
+    {
+        return SyntaxCheck::Invalid(format!("writing to stdin failed: {error}"));
     }
-    let output = child.wait_with_output().ok()?;
-    if !output.status.success() {
-        eprintln!(
-            "{}: interpreter rejected the rendered source:\n{}",
-            template.id,
-            String::from_utf8_lossy(&output.stderr)
-        );
+    match child.wait_with_output() {
+        Ok(output) if output.status.success() => SyntaxCheck::Valid,
+        Ok(output) => SyntaxCheck::Invalid(String::from_utf8_lossy(&output.stderr).into_owned()),
+        Err(error) => SyntaxCheck::Invalid(format!("waiting for the interpreter failed: {error}")),
     }
-    Some(output.status.success())
 }
 
 #[test]
@@ -359,9 +373,11 @@ fn rendered_scripts_parse_in_their_interpreter() {
     for template in templates::all() {
         let source = template.render_default().expect("default render");
         match syntax_is_valid(template, &source) {
-            Some(true) => {}
-            Some(false) => panic!("{}: rendered source does not parse", template.id),
-            None => eprintln!(
+            SyntaxCheck::Valid => {}
+            SyntaxCheck::Invalid(reason) => {
+                panic!("{}: syntax check failed:\n{reason}", template.id);
+            }
+            SyntaxCheck::Skipped => eprintln!(
                 "skipping syntax check for {}: {} not found",
                 template.id,
                 template.language.binary_name()
@@ -399,6 +415,34 @@ fn package_available(language: CodeLanguage, package: &str) -> bool {
     status.map(|status| status.success()).unwrap_or(false)
 }
 
+/// Whether the interpreter and every declared package are available.
+/// Prints the reason and returns false when the check must be skipped.
+fn dependencies_available(template: &Template) -> bool {
+    if !is_language_available(template.language) {
+        eprintln!(
+            "skipping {}: {} not found",
+            template.id,
+            template.language.binary_name()
+        );
+        return false;
+    }
+    let missing: Vec<&str> = template
+        .requires
+        .iter()
+        .copied()
+        .filter(|package| !package_available(template.language, package))
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "skipping {}: missing package(s) {}",
+            template.id,
+            missing.join(", ")
+        );
+        return false;
+    }
+    true
+}
+
 #[test]
 fn templates_execute_when_their_packages_are_installed() {
     const PLOTTING: &[&str] = &[
@@ -410,26 +454,7 @@ fn templates_execute_when_their_packages_are_installed() {
     ];
 
     for template in templates::all() {
-        if !is_language_available(template.language) {
-            eprintln!(
-                "skipping execution of {}: {} not found",
-                template.id,
-                template.language.binary_name()
-            );
-            continue;
-        }
-        let missing: Vec<&str> = template
-            .requires
-            .iter()
-            .copied()
-            .filter(|package| !package_available(template.language, package))
-            .collect();
-        if !missing.is_empty() {
-            eprintln!(
-                "skipping execution of {}: missing package(s) {}",
-                template.id,
-                missing.join(", ")
-            );
+        if !dependencies_available(template) {
             continue;
         }
 
@@ -455,5 +480,30 @@ fn templates_execute_when_their_packages_are_installed() {
                 template.id
             );
         }
+    }
+}
+
+#[test]
+fn correlation_template_supports_its_documented_methods() {
+    let template = templates::find("python.correlation-heatmap").expect("built-in template");
+    if !dependencies_available(template) {
+        return;
+    }
+
+    for method in ["pearson", "spearman", "kendall"] {
+        let script = template
+            .render(&[("method", method)])
+            .expect("documented method must render");
+        let request = ExecutionRequest::new(template.language, script).with_timeout(120_000);
+        let result = execute(&request).expect("the interpreter is available");
+        assert!(
+            result.success,
+            "method {method} failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            result.stdout, result.stderr
+        );
+        assert!(
+            result.plot_png.is_some(),
+            "method {method}: expected the heat map to be captured"
+        );
     }
 }

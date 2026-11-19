@@ -182,6 +182,29 @@ print(
 }
 
 #[test]
+fn execution_directory_is_removed_after_execution() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    // The snippet leaves an extra file behind, as the ingestion template does.
+    let code = "import os\nprint(os.getcwd())\nopen('extra-output.csv', 'w').write('x')\n";
+    let result =
+        execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
+
+    assert!(result.success, "stderr: {}", result.stderr);
+    let directory = result.stdout.trim();
+    assert!(
+        directory.contains("wordcraft-chunk-"),
+        "unexpected working directory: {directory}"
+    );
+    assert!(
+        !std::path::Path::new(directory).exists(),
+        "temporary directory was left behind: {directory}"
+    );
+}
+
+#[test]
 fn python_plot_capture() {
     if !is_language_available(CodeLanguage::Python) {
         return;
@@ -196,7 +219,8 @@ plt.plot([1, 2, 3], [10, 20, 30])
     let result = execute(&req).expect("execution failed");
 
     assert!(result.success);
-    if let Some(png_bytes) = result.plot_png {
-        assert!(png_bytes.starts_with(&[0x89, b'P', b'N', b'G']));
-    }
+    let png_bytes = result
+        .plot_png
+        .expect("expected the Python plot to be captured");
+    assert!(png_bytes.starts_with(&[0x89, b'P', b'N', b'G']));
 }
