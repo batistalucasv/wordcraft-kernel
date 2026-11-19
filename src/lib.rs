@@ -4,6 +4,9 @@
 //! output capture (stdout, stderr, exit status), plot interception (PNG and vector SVG),
 //! and structured capture of tabular data (R `data.frame` and Python `pandas.DataFrame`).
 //! [`templates`] ships ready-made ecology and statistics snippets for both languages.
+//!
+//! [`SessionManager`] runs chunks in a persistent daemon per `session_id`, so variables,
+//! imports, and environment state persist across multiple executions.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -14,6 +17,10 @@
 )]
 
 pub mod templates;
+
+mod session;
+
+pub use session::{DEFAULT_IDLE_TIMEOUT, SessionInfo, SessionManager};
 
 use std::fmt;
 use std::fs;
@@ -276,6 +283,19 @@ pub enum KernelError {
 
     #[error("Template '{template}' has an unterminated placeholder")]
     UnterminatedPlaceholder { template: String },
+
+    #[error("Session '{session_id}' was started for {existing}, but request is for {requested}")]
+    SessionLanguageMismatch {
+        session_id: String,
+        existing: CodeLanguage,
+        requested: CodeLanguage,
+    },
+
+    #[error("Session '{session_id}' terminated unexpectedly: {detail}")]
+    SessionTerminated { session_id: String, detail: String },
+
+    #[error("Session protocol error: {0}")]
+    SessionProtocol(String),
 }
 
 /// Check if the interpreter for a given language is available on the host system.
@@ -1168,3 +1188,6 @@ mod template_tests;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod session_tests;
