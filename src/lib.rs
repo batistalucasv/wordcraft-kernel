@@ -617,6 +617,18 @@ fn find_supervisor_binary(configured: Option<&Path>) -> Result<PathBuf, KernelEr
         }
     }
 
+    #[cfg(test)]
+    if let Ok(current_exe) = std::env::current_exe() {
+        for directory in current_exe.ancestors() {
+            let candidate = directory.join(executable_name);
+            if candidate.is_file() {
+                return fs::canonicalize(candidate).map_err(|error| {
+                    KernelError::Io(format!("resolve supervisor from test target: {error}"))
+                });
+            }
+        }
+    }
+
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
             let candidate = dir.join(executable_name);

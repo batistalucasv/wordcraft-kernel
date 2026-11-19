@@ -2,29 +2,6 @@
 
 use super::*;
 
-fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelError> {
-    if request.supervisor_path.is_some() {
-        return super::execute(request);
-    }
-
-    let executable_name = if cfg!(windows) {
-        "wc-kernel-supervisor.exe"
-    } else {
-        "wc-kernel-supervisor"
-    };
-    let supervisor_path = std::env::current_exe().ok().and_then(|path| {
-        path.ancestors()
-            .map(|directory| directory.join(executable_name))
-            .find(|candidate| candidate.is_file())
-    });
-
-    if let Some(path) = supervisor_path {
-        super::execute(&request.clone().with_supervisor_path(path))
-    } else {
-        super::execute(request)
-    }
-}
-
 struct TempTestDir {
     path: PathBuf,
 }
