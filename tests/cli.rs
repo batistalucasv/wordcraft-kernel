@@ -336,6 +336,80 @@ fn cli_ctrl_c_during_stdin_read_exits_without_running_code() {
 
 #[cfg(unix)]
 #[test]
+fn cli_ctrl_c_interrupts_a_blocked_output_write() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+        return;
+    }
+
+    let fixture = TestDir::new("wc-output-block");
+    let working_dir = fixture.join("cwd");
+    let scratch_dir = fixture.join("scratch");
+    fs::create_dir(&working_dir).expect("create working directory");
+    fs::create_dir(&scratch_dir).expect("create scratch directory");
+
+    // 4 MiB fills the pipe buffer, so the CLI blocks writing the result.
+    let code = "from pathlib import Path\nprint('x' * (4 * 1024 * 1024))\nPath('printed').touch()";
+    let mut child = Command::new(binary_path())
+        .args(["--lang", "py", "--eval", code, "--cwd"])
+        .arg(&working_dir)
+        .arg("--no-plot")
+        .env("TMPDIR", &scratch_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn wc-kernel");
+
+    // Keep the read end open and never drain it.
+    let stdout = child.stdout.take().expect("stdout piped");
+    let printed = working_dir.join("printed");
+    let startup_deadline = Instant::now() + Duration::from_secs(10);
+    while !printed.is_file() {
+        if let Some(status) = child.try_wait().expect("check wc-kernel status") {
+            panic!("wc-kernel exited before writing output: {status}");
+        }
+        assert!(
+            Instant::now() < startup_deadline,
+            "user code did not start before the deadline"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Let the interpreter exit and the CLI start writing into the full pipe.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let pid = i32::try_from(child.id()).expect("wc-kernel PID fits in i32");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .expect("send SIGINT to wc-kernel");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("check wc-kernel status") {
+            break status;
+        }
+        if Instant::now() >= exit_deadline {
+            child.kill().expect("stop unresponsive wc-kernel");
+            let _ = child.wait();
+            drop(stdout);
+            panic!("wc-kernel stayed blocked while writing output");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(stdout);
+
+    assert_eq!(status.code(), Some(130));
+    assert_eq!(
+        fs::read_dir(&scratch_dir)
+            .expect("read scratch directory")
+            .count(),
+        0,
+        "execution workspace was not cleaned up after SIGINT"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn cli_closed_stdout_pipe_does_not_panic() {
     if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
         return;

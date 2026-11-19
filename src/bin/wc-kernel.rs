@@ -63,6 +63,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 enum CliError {
     Usage(String),
     Runtime(String),
+    Interrupted,
 }
 
 #[derive(Debug, Default)]
@@ -171,28 +172,73 @@ fn set_file_path(cli: &mut CliArgs, path: PathBuf) -> Result<(), CliError> {
     Ok(())
 }
 
-fn write_all(handle: &mut impl Write, bytes: &[u8]) -> Result<(), CliError> {
-    match handle.write_all(bytes).and_then(|()| handle.flush()) {
-        Ok(()) => Ok(()),
-        // The reader closed the pipe. Stop reporting, but let the completed
-        // script's own exit status decide how the CLI ends.
-        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        Err(error) => Err(CliError::Runtime(format!(
-            "failed to write output: {error}"
-        ))),
+#[derive(Clone, Copy)]
+enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// Write through a helper thread so a full pipe cannot trap the run.
+///
+/// A closed pipe keeps the script's own exit status; a cancelled run returns
+/// `Interrupted`, which `main` maps to status 130.
+fn write_stream(
+    stream: OutputStream,
+    bytes: Vec<u8>,
+    cancelled: &AtomicBool,
+) -> Result<(), CliError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CliError::Interrupted);
+    }
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("wc-kernel-output".to_string())
+        .spawn(move || {
+            let result = match stream {
+                OutputStream::Stdout => {
+                    let stdout = io::stdout();
+                    let mut handle = stdout.lock();
+                    handle.write_all(&bytes).and_then(|()| handle.flush())
+                }
+                OutputStream::Stderr => {
+                    let stderr = io::stderr();
+                    let mut handle = stderr.lock();
+                    handle.write_all(&bytes).and_then(|()| handle.flush())
+                }
+            };
+            let _ = sender.send(result);
+        })
+        .map_err(|error| CliError::Runtime(format!("failed to start output writer: {error}")))?;
+
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(25)) {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
+            Ok(Err(error)) => {
+                return Err(CliError::Runtime(format!(
+                    "failed to write output: {error}"
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(CliError::Interrupted);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(CliError::Runtime(
+                    "failed to write output: writer stopped".to_string(),
+                ));
+            }
+        }
     }
 }
 
-fn write_stdout(text: &str) -> Result<(), CliError> {
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-    write_all(&mut handle, text.as_bytes())
+fn write_stdout(text: &str, cancelled: &AtomicBool) -> Result<(), CliError> {
+    write_stream(OutputStream::Stdout, text.as_bytes().to_vec(), cancelled)
 }
 
-fn write_stderr(text: &str) -> Result<(), CliError> {
-    let stderr = io::stderr();
-    let mut handle = stderr.lock();
-    write_all(&mut handle, text.as_bytes())
+fn write_stderr(text: &str, cancelled: &AtomicBool) -> Result<(), CliError> {
+    write_stream(OutputStream::Stderr, text.as_bytes().to_vec(), cancelled)
 }
 
 /// Read all of stdin while staying responsive to cancellation.
@@ -232,7 +278,7 @@ fn read_stdin(cancelled: &AtomicBool) -> Result<Option<String>, CliError> {
     }
 }
 
-fn parse_args<I, S>(args: I) -> Result<Option<CliArgs>, CliError>
+fn parse_args<I, S>(args: I, cancelled: &AtomicBool) -> Result<Option<CliArgs>, CliError>
 where
     I: Iterator<Item = S>,
     S: Into<OsString>,
@@ -274,10 +320,10 @@ where
             continue;
         };
         if arg == "-h" || arg == "--help" {
-            write_stdout(USAGE)?;
+            write_stdout(USAGE, cancelled)?;
             return Ok(None);
         } else if arg == "-V" || arg == "--version" {
-            write_stdout(&format!("wc-kernel {VERSION}\n"))?;
+            write_stdout(&format!("wc-kernel {VERSION}\n"), cancelled)?;
             return Ok(None);
         } else if arg == "--json" {
             cli.json = true;
@@ -437,7 +483,7 @@ fn infer_language_from_path(path: &Path) -> Option<CodeLanguage> {
 
 fn run(cancelled: &AtomicBool) -> Result<ExitCode, CliError> {
     let args = std::env::args_os().skip(1);
-    let maybe_cli = parse_args(args)?;
+    let maybe_cli = parse_args(args, cancelled)?;
     let cli = match maybe_cli {
         Some(c) => c,
         None => return Ok(ExitCode::SUCCESS),
@@ -577,36 +623,43 @@ fn run(cancelled: &AtomicBool) -> Result<ExitCode, CliError> {
         };
 
         if !written && export_error.is_none() && cli.capture_plots {
-            write_stderr(&format!(
-                "wc-kernel: warning: script did not produce a {} plot; '{}' was not written\n",
-                plot_format_name(target_format),
-                plot_path.display(),
-            ))?;
+            write_stderr(
+                &format!(
+                    "wc-kernel: warning: script did not produce a {} plot; '{}' was not written\n",
+                    plot_format_name(target_format),
+                    plot_path.display(),
+                ),
+                cancelled,
+            )?;
         }
     }
 
     if cli.json {
         let json_str = serde_json::to_string_pretty(&result)
             .map_err(|e| CliError::Runtime(format!("failed to serialize JSON output: {e}")))?;
-        write_stdout(&format!("{json_str}\n"))?;
+        write_stdout(&format!("{json_str}\n"), cancelled)?;
     } else {
         if !result.stdout.is_empty() {
-            write_stdout(&result.stdout)?;
+            write_stdout(&result.stdout, cancelled)?;
         }
         if !result.stderr.is_empty() {
-            write_stderr(&result.stderr)?;
+            write_stderr(&result.stderr, cancelled)?;
         }
         if result.timed_out {
-            write_stderr(&format!(
-                "wc-kernel: execution timed out after {} ms\n",
-                cli.timeout_ms
-            ))?;
+            write_stderr(
+                &format!(
+                    "wc-kernel: execution timed out after {} ms\n",
+                    cli.timeout_ms
+                ),
+                cancelled,
+            )?;
         }
     }
 
     if result.output_truncated {
         write_stderr(
             "wc-kernel: warning: output exceeded the capture limit; captured output was truncated\n",
+            cancelled,
         )?;
     }
 
@@ -669,6 +722,7 @@ fn main() -> ExitCode {
             let _ = writeln!(io::stderr(), "wc-kernel: error: {msg}");
             ExitCode::from(1)
         }
+        Err(CliError::Interrupted) => ExitCode::from(130),
     }
 }
 
@@ -677,11 +731,12 @@ mod tests {
     use super::*;
 
     fn parse_cli(args: Vec<String>) -> io::Result<Option<CliArgs>> {
-        parse_args(args.into_iter()).map_err(|error| io::Error::other(format!("{error:?}")))
+        parse_args(args.into_iter(), &AtomicBool::new(false))
+            .map_err(|error| io::Error::other(format!("{error:?}")))
     }
 
     fn assert_usage_error(args: Vec<String>) -> io::Result<()> {
-        match parse_args(args.into_iter()) {
+        match parse_args(args.into_iter(), &AtomicBool::new(false)) {
             Err(CliError::Usage(_)) => Ok(()),
             Err(error) => Err(io::Error::other(format!(
                 "unexpected parser error: {error:?}"
