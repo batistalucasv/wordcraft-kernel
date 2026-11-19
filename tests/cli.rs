@@ -1,0 +1,328 @@
+use std::fs;
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+fn binary_path() -> &'static str {
+    env!("CARGO_BIN_EXE_wc-kernel")
+}
+
+#[test]
+fn cli_help_flag() {
+    let output = Command::new(binary_path())
+        .arg("--help")
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("USAGE:"));
+    assert!(stdout.contains("--lang"));
+    assert!(stdout.contains("--eval"));
+    assert!(stdout.contains("--json"));
+    assert!(stdout.contains("--out-plot"));
+}
+
+#[test]
+fn cli_version_flag() {
+    let output = Command::new(binary_path())
+        .arg("--version")
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("wc-kernel 0.1.0"));
+}
+
+#[test]
+fn cli_acceptance_r_eval_basic() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::R).is_none() {
+        eprintln!("Skipping R test: Rscript not found");
+        return;
+    }
+
+    let output = Command::new(binary_path())
+        .args(["--lang", "r", "-e", "print(1+1)"])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("[1] 2"));
+}
+
+#[test]
+fn cli_acceptance_r_eval_json() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::R).is_none() {
+        eprintln!("Skipping R test: Rscript not found");
+        return;
+    }
+
+    let output = Command::new(binary_path())
+        .args(["--lang", "r", "-e", "print(1+1)", "--json"])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+
+    assert_eq!(json["success"], true);
+    assert_eq!(json["timed_out"], false);
+    assert_eq!(json["exit_code"], 0);
+    assert!(
+        json["stdout"]
+            .as_str()
+            .expect("stdout string")
+            .contains("[1] 2")
+    );
+}
+
+#[test]
+fn cli_python_eval_basic() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+        eprintln!("Skipping Python test: python3 not found");
+        return;
+    }
+
+    let output = Command::new(binary_path())
+        .args(["--lang", "py", "-e", "print(10 + 25)"])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "35");
+}
+
+#[test]
+fn cli_python_eval_json() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+        eprintln!("Skipping Python test: python3 not found");
+        return;
+    }
+
+    let output = Command::new(binary_path())
+        .args(["--lang", "py", "-e", "print('hello json')", "--json"])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+
+    assert_eq!(json["success"], true);
+    assert_eq!(json["timed_out"], false);
+    assert_eq!(json["exit_code"], 0);
+    assert!(
+        json["stdout"]
+            .as_str()
+            .expect("stdout string")
+            .contains("hello json")
+    );
+}
+
+#[test]
+fn cli_stdin_pipe_execution() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+        eprintln!("Skipping Python test: python3 not found");
+        return;
+    }
+
+    let mut child = Command::new(binary_path())
+        .args(["--lang", "py"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn child");
+
+    {
+        let stdin = child.stdin.as_mut().expect("stdin piped");
+        stdin
+            .write_all(b"x = 5\ny = 7\nprint(x * y)\n")
+            .expect("write to stdin");
+    }
+
+    let output = child.wait_with_output().expect("wait with output");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "35");
+}
+
+#[test]
+fn cli_file_execution_and_inference() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+        eprintln!("Skipping Python test: python3 not found");
+        return;
+    }
+
+    let temp_dir = std::env::temp_dir().join(format!("wc-test-{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).expect("create temp dir");
+    let script_file = temp_dir.join("test_script.py");
+    fs::write(&script_file, "print('inferred python works')").expect("write test script");
+
+    // Execute without --lang, inferring from .py extension
+    let output = Command::new(binary_path())
+        .args(["--file", script_file.to_str().expect("valid path")])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "inferred python works");
+
+    let _ = fs::remove_file(script_file);
+    let _ = fs::remove_dir(temp_dir);
+}
+
+#[test]
+fn cli_out_plot_png_saved() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::R).is_none() {
+        eprintln!("Skipping R test: Rscript not found");
+        return;
+    }
+
+    let temp_dir = std::env::temp_dir().join(format!("wc-plot-test-{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).expect("create temp dir");
+    let plot_file = temp_dir.join("generated_plot.png");
+
+    let output = Command::new(binary_path())
+        .args([
+            "--lang",
+            "r",
+            "-e",
+            "plot(1:10, 1:10, main='CLI Plot Test')",
+            "--out-plot",
+            plot_file.to_str().expect("valid path"),
+        ])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert!(output.status.success());
+    assert!(plot_file.is_file(), "plot file should have been written");
+    let bytes = fs::read(&plot_file).expect("read plot file");
+    assert!(
+        bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+        "file must be a valid PNG"
+    );
+
+    let _ = fs::remove_file(plot_file);
+    let _ = fs::remove_dir(temp_dir);
+}
+
+#[test]
+fn cli_out_plot_svg_saved() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::R).is_none() {
+        eprintln!("Skipping R test: Rscript not found");
+        return;
+    }
+
+    let temp_dir = std::env::temp_dir().join(format!("wc-svg-test-{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).expect("create temp dir");
+    let plot_file = temp_dir.join("generated_plot.svg");
+
+    let output = Command::new(binary_path())
+        .args([
+            "--lang",
+            "r",
+            "-e",
+            "plot(1:10, 1:10, main='CLI SVG Test')",
+            "--out-plot",
+            plot_file.to_str().expect("valid path"),
+        ])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert!(output.status.success());
+    assert!(
+        plot_file.is_file(),
+        "svg plot file should have been written"
+    );
+    let content = fs::read_to_string(&plot_file).expect("read svg plot file");
+    assert!(
+        content.contains("<svg") && content.contains("</svg>"),
+        "file must be a valid SVG"
+    );
+
+    let _ = fs::remove_file(plot_file);
+    let _ = fs::remove_dir(temp_dir);
+}
+
+#[test]
+fn cli_timeout_enforced() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+        eprintln!("Skipping Python test: python3 not found");
+        return;
+    }
+
+    let output = Command::new(binary_path())
+        .args([
+            "--lang",
+            "py",
+            "-e",
+            "import time\nwhile True:\n    time.sleep(0.05)",
+            "--timeout",
+            "300",
+        ])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert!(!output.status.success());
+    // Unix timeout exit code is typically 124
+    let code = output.status.code().expect("exit code");
+    assert_eq!(code, 124);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("timed out after 300 ms"));
+}
+
+#[test]
+fn cli_syntax_error_returns_nonzero_and_json() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+        eprintln!("Skipping Python test: python3 not found");
+        return;
+    }
+
+    let output = Command::new(binary_path())
+        .args(["--lang", "py", "-e", "def broken(: syntax error", "--json"])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("output must still be valid JSON");
+
+    assert_eq!(json["success"], false);
+    assert_ne!(json["exit_code"], 0);
+    assert!(
+        json["stderr"]
+            .as_str()
+            .expect("stderr string")
+            .contains("SyntaxError")
+    );
+}
+
+#[test]
+fn cli_invalid_arguments_handled() {
+    let output = Command::new(binary_path())
+        .args(["--nonexistent-option"])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unrecognized option"));
+}
+
+#[test]
+fn cli_missing_language_handled() {
+    let output = Command::new(binary_path())
+        .args(["-e", "print(1)"])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing required argument --lang"));
+}
