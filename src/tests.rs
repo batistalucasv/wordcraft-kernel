@@ -183,6 +183,18 @@ fn python_timeout_preserves_partial_stdout() {
 }
 
 #[test]
+fn capture_sink_caps_single_burst() {
+    let burst = vec![b'x'; MAX_CAPTURE_BYTES as usize + 1024];
+    let (sink, done) = spawn_capture(std::io::Cursor::new(burst), MAX_CAPTURE_BYTES as usize);
+
+    done.recv_timeout(Duration::from_secs(1))
+        .expect("capture reader must finish");
+
+    assert!(sink.is_truncated());
+    assert_eq!(sink.text().len() as u64, MAX_CAPTURE_BYTES);
+}
+
+#[test]
 fn python_output_budget_limits_capture() {
     if !is_language_available(CodeLanguage::Python) {
         return;
