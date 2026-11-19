@@ -53,6 +53,7 @@ fn execution_request_deserialization_defaults_plot_options() {
         serde_json::from_str(explicit_preference).expect("deserialize explicit preference");
     assert_eq!(request.plot_format, PlotFormat::Png);
     assert!(request.prefer_svg);
+    assert_eq!(request.effective_plot_format(), PlotFormat::Svg);
 }
 
 #[test]
@@ -199,6 +200,25 @@ plot(x, y, main = "Test SVG Curve")
 }
 
 #[test]
+fn r_plot_prefer_svg_deserialized_request() {
+    if !is_language_available(CodeLanguage::R) {
+        return;
+    }
+
+    let json = r#"{"language":"r","code":"plot(1:5)","timeout_ms":30000,"capture_plots":true,"prefer_svg":true}"#;
+    let req: ExecutionRequest = serde_json::from_str(json).expect("deserialize request");
+    let result = execute(&req).expect("execution failed");
+
+    assert!(result.success);
+    assert!(result.plot_png.is_none());
+    assert!(
+        result.plot_svg.is_some(),
+        "Expected SVG capture from prefer_svg"
+    );
+    assert!(result.plot_svg.unwrap().contains("<svg"));
+}
+
+#[test]
 fn r_plot_both_capture() {
     if !is_language_available(CodeLanguage::R) {
         return;
@@ -253,7 +273,40 @@ fn python_has_matplotlib() -> bool {
 fn execution_request_prefer_svg() {
     let req = ExecutionRequest::new(CodeLanguage::R, "plot(1:5)").with_prefer_svg(true);
     assert!(req.prefer_svg);
-    assert_eq!(req.plot_format, PlotFormat::Svg);
+    assert_eq!(req.plot_format, PlotFormat::Png);
+    assert_eq!(req.effective_plot_format(), PlotFormat::Svg);
+}
+
+#[test]
+fn effective_plot_format_combinations() {
+    let base = ExecutionRequest::new(CodeLanguage::Python, "");
+
+    assert_eq!(base.effective_plot_format(), PlotFormat::Png);
+
+    let svg_by_preference = base.clone().with_prefer_svg(true);
+    assert_eq!(svg_by_preference.effective_plot_format(), PlotFormat::Svg);
+
+    let both_with_preference = base
+        .clone()
+        .with_plot_format(PlotFormat::Both)
+        .with_prefer_svg(true);
+    assert_eq!(
+        both_with_preference.effective_plot_format(),
+        PlotFormat::Both
+    );
+
+    let explicit_svg = base
+        .clone()
+        .with_prefer_svg(true)
+        .with_plot_format(PlotFormat::Svg)
+        .with_prefer_svg(false);
+    assert_eq!(explicit_svg.effective_plot_format(), PlotFormat::Svg);
+
+    let png_with_preference = base
+        .clone()
+        .with_plot_format(PlotFormat::Png)
+        .with_prefer_svg(true);
+    assert_eq!(png_with_preference.effective_plot_format(), PlotFormat::Svg);
 }
 
 #[test]
@@ -300,6 +353,36 @@ plt.plot([1, 2, 3], [10, 20, 30])
     assert!(result.plot_svg.is_some(), "Expected SVG plot output");
     let svg = result.plot_svg.unwrap();
     assert!(svg.contains("<svg") && svg.contains("</svg>"));
+}
+
+#[test]
+fn python_plot_prefer_svg_deserialized_request() {
+    if !python_has_matplotlib() {
+        return;
+    }
+
+    let code = r#"
+import matplotlib.pyplot as plt
+plt.figure()
+plt.plot([1, 2, 3], [10, 20, 30])
+"#;
+    let req: ExecutionRequest = serde_json::from_value(serde_json::json!({
+        "language": "python",
+        "code": code,
+        "timeout_ms": 30_000,
+        "capture_plots": true,
+        "prefer_svg": true,
+    }))
+    .expect("deserialize request");
+    let result = execute(&req).expect("execution failed");
+
+    assert!(result.success);
+    assert!(result.plot_png.is_none());
+    assert!(
+        result.plot_svg.is_some(),
+        "Expected SVG capture from prefer_svg"
+    );
+    assert!(result.plot_svg.unwrap().contains("<svg"));
 }
 
 #[test]
