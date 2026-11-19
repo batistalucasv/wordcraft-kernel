@@ -63,6 +63,8 @@ OPTIONS:
 
 Scripts run in the directory where you invoked `wc-kernel` unless `-C` is given, so relative reads and writes resolve there. When running a Python file with `--file`, its directory is also added to the module search path, so sibling imports keep working.
 
+Captured output is capped at 10 MiB per stream. A script that exceeds the cap is stopped, the captured text is truncated, and `output_truncated` is set to `true` in the JSON result.
+
 ### CLI Examples
 
 **Evaluate code inline:**

@@ -13,6 +13,7 @@
 
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
@@ -22,6 +23,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Maximum bytes kept from each captured stream (stdout and stderr).
+const MAX_CAPTURE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Programming language for a code chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -205,6 +209,9 @@ pub struct ExecutionResult {
     pub success: bool,
     /// True if execution was halted due to timeout limit.
     pub timed_out: bool,
+    /// True if stdout or stderr exceeded the capture limit and was truncated.
+    #[serde(default)]
+    pub output_truncated: bool,
     /// PNG bytes of plot/chart if generated and captured.
     pub plot_png: Option<Vec<u8>>,
     /// Vector SVG XML string of plot/chart if generated and captured.
@@ -321,12 +328,17 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
         .spawn()
         .map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?;
 
-    let (exit_status, timed_out) =
-        wait_with_timeout(&mut child, Duration::from_millis(request.timeout_ms));
+    let outcome = wait_with_timeout(
+        &mut child,
+        Duration::from_millis(request.timeout_ms),
+        &stdout_path,
+        &stderr_path,
+    );
     let duration_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
-    let stdout = read_capture(&stdout_path);
-    let stderr = read_capture(&stderr_path);
+    let (stdout, stdout_truncated) = read_capture(&stdout_path, MAX_CAPTURE_BYTES);
+    let (stderr, stderr_truncated) = read_capture(&stderr_path, MAX_CAPTURE_BYTES);
+    let output_truncated = outcome.output_limited || stdout_truncated || stderr_truncated;
 
     let mut plot_png = None;
     if request.capture_plots && plot_format.captures_png() && plot_png_path.is_file() {
@@ -342,15 +354,16 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
             .filter(|content| is_complete_svg(content));
     }
 
-    let exit_code = exit_status.and_then(|s| s.code());
-    let success = exit_status.map(|s| s.success()).unwrap_or(false) && !timed_out;
+    let exit_code = outcome.status.and_then(|s| s.code());
+    let success = outcome.status.map(|s| s.success()).unwrap_or(false) && !outcome.timed_out;
 
     Ok(ExecutionResult {
         stdout,
         stderr,
         exit_code,
         success,
-        timed_out,
+        timed_out: outcome.timed_out,
+        output_truncated,
         plot_png,
         plot_svg,
         duration_ms,
@@ -423,38 +436,94 @@ fn create_capture_file(path: &Path) -> std::io::Result<fs::File> {
     options.open(path)
 }
 
-fn read_capture(path: &Path) -> String {
-    fs::read(path)
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default()
+/// Read at most `limit` bytes from a capture file.
+///
+/// Returns the decoded text and whether more bytes were written than kept.
+fn read_capture(path: &Path, limit: u64) -> (String, bool) {
+    let Ok(file) = fs::File::open(path) else {
+        return (String::new(), false);
+    };
+    let mut bytes = Vec::new();
+    let _ = file.take(limit.saturating_add(1)).read_to_end(&mut bytes);
+    let truncated = bytes.len() as u64 > limit;
+    bytes.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    (String::from_utf8_lossy(&bytes).into_owned(), truncated)
 }
 
-/// Wait for child process with timeout. Kills the child if timeout is reached.
+struct WaitOutcome {
+    status: Option<std::process::ExitStatus>,
+    timed_out: bool,
+    output_limited: bool,
+}
+
+/// Wait for the child, killing it on timeout or when capture exceeds its limit.
 fn wait_with_timeout(
     child: &mut Child,
     timeout: Duration,
-) -> (Option<std::process::ExitStatus>, bool) {
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> WaitOutcome {
     let start = Instant::now();
-    let step = Duration::from_millis(20);
+    let step = Duration::from_millis(10);
 
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return (Some(status), false),
+            Ok(Some(status)) => {
+                return WaitOutcome {
+                    status: Some(status),
+                    timed_out: false,
+                    output_limited: false,
+                };
+            }
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return (None, true);
+                    return WaitOutcome {
+                        status: None,
+                        timed_out: true,
+                        output_limited: false,
+                    };
+                }
+                if capture_limit_reached(stdout_path, stderr_path, MAX_CAPTURE_BYTES) {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        return WaitOutcome {
+                            status: Some(status),
+                            timed_out: false,
+                            output_limited: true,
+                        };
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return WaitOutcome {
+                        status: None,
+                        timed_out: false,
+                        output_limited: true,
+                    };
                 }
                 std::thread::sleep(step);
             }
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return (None, false);
+                return WaitOutcome {
+                    status: None,
+                    timed_out: false,
+                    output_limited: false,
+                };
             }
         }
     }
+}
+
+fn capture_limit_reached(stdout_path: &Path, stderr_path: &Path, limit: u64) -> bool {
+    capture_len(stdout_path) > limit || capture_len(stderr_path) > limit
+}
+
+fn capture_len(path: &Path) -> u64 {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
 }
 
 /// Whether `content` is a non-trivial and complete SVG document.

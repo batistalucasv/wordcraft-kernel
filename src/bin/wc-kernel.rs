@@ -461,6 +461,12 @@ fn run() -> Result<ExitCode, CliError> {
         }
     }
 
+    if result.output_truncated {
+        eprintln!(
+            "wc-kernel: warning: output exceeded the capture limit; captured output was truncated"
+        );
+    }
+
     if let Some(err) = export_error {
         return Err(err);
     }
