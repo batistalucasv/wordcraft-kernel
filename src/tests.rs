@@ -197,9 +197,24 @@ plot(x, y, main = "Test Both Curve")
     assert!(result.plot_svg.unwrap().contains("<svg"));
 }
 
+fn python_has_matplotlib() -> bool {
+    if !is_language_available(CodeLanguage::Python) {
+        return false;
+    }
+    let req = ExecutionRequest::new(CodeLanguage::Python, "import matplotlib");
+    execute(&req).map(|r| r.success).unwrap_or(false)
+}
+
+#[test]
+fn execution_request_prefer_svg() {
+    let req = ExecutionRequest::new(CodeLanguage::R, "plot(1:5)").with_prefer_svg(true);
+    assert!(req.prefer_svg);
+    assert_eq!(req.plot_format, PlotFormat::Svg);
+}
+
 #[test]
 fn python_plot_png_capture() {
-    if !is_language_available(CodeLanguage::Python) {
+    if !python_has_matplotlib() {
         return;
     }
 
@@ -212,15 +227,19 @@ plt.plot([1, 2, 3], [10, 20, 30])
     let result = execute(&req).expect("execution failed");
 
     assert!(result.success);
-    if let Some(png_bytes) = result.plot_png {
-        assert!(png_bytes.starts_with(&[0x89, b'P', b'N', b'G']));
-    }
+    assert!(result.plot_png.is_some(), "Expected PNG plot output");
+    assert!(
+        result
+            .plot_png
+            .unwrap()
+            .starts_with(&[0x89, b'P', b'N', b'G'])
+    );
     assert!(result.plot_svg.is_none());
 }
 
 #[test]
 fn python_plot_svg_capture() {
-    if !is_language_available(CodeLanguage::Python) {
+    if !python_has_matplotlib() {
         return;
     }
 
@@ -234,14 +253,14 @@ plt.plot([1, 2, 3], [10, 20, 30])
 
     assert!(result.success);
     assert!(result.plot_png.is_none());
-    if let Some(svg) = result.plot_svg {
-        assert!(svg.contains("<svg"));
-    }
+    assert!(result.plot_svg.is_some(), "Expected SVG plot output");
+    let svg = result.plot_svg.unwrap();
+    assert!(svg.contains("<svg") && svg.contains("</svg>"));
 }
 
 #[test]
 fn python_plot_both_capture() {
-    if !is_language_available(CodeLanguage::Python) {
+    if !python_has_matplotlib() {
         return;
     }
 
@@ -254,8 +273,7 @@ plt.plot([1, 2, 3], [10, 20, 30])
     let result = execute(&req).expect("execution failed");
 
     assert!(result.success);
-    if result.plot_png.is_some() {
-        assert!(result.plot_svg.is_some());
-        assert!(result.plot_svg.unwrap().contains("<svg"));
-    }
+    assert!(result.plot_png.is_some(), "Expected PNG in Both mode");
+    assert!(result.plot_svg.is_some(), "Expected SVG in Both mode");
+    assert!(result.plot_svg.unwrap().contains("<svg"));
 }

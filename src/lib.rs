@@ -114,6 +114,8 @@ pub struct ExecutionRequest {
     pub capture_plots: bool,
     /// Desired format for captured plots (PNG, SVG, or Both).
     pub plot_format: PlotFormat,
+    /// Whether SVG plot format is preferred over default PNG (Issue #1 requirement).
+    pub prefer_svg: bool,
     /// Optional working directory.
     pub working_dir: Option<PathBuf>,
 }
@@ -127,6 +129,7 @@ impl ExecutionRequest {
             timeout_ms: 30_000,
             capture_plots: true,
             plot_format: PlotFormat::Png,
+            prefer_svg: false,
             working_dir: None,
         }
     }
@@ -146,6 +149,18 @@ impl ExecutionRequest {
     /// Set the desired plot format.
     pub fn with_plot_format(mut self, format: PlotFormat) -> Self {
         self.plot_format = format;
+        if format == PlotFormat::Svg {
+            self.prefer_svg = true;
+        }
+        self
+    }
+
+    /// Set SVG preference flag directly.
+    pub fn with_prefer_svg(mut self, prefer: bool) -> Self {
+        self.prefer_svg = prefer;
+        if prefer {
+            self.plot_format = PlotFormat::Svg;
+        }
         self
     }
 
@@ -374,6 +389,7 @@ fn prepare_wrapped_code(
                 r#"options(warn = 1)
 .wc_plot_png <- "{png_str}"
 setHook("plot.new", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
+setHook("grid.newpage", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
 png(.wc_plot_png, width = 1600, height = 1200, res = 200)
 tryCatch({{
 {code}
@@ -389,6 +405,7 @@ tryCatch({{
                 r#"options(warn = 1)
 .wc_plot_svg <- "{svg_str}"
 setHook("plot.new", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
+setHook("grid.newpage", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
 svg(.wc_plot_svg, width = 8, height = 6)
 tryCatch({{
 {code}
@@ -405,6 +422,7 @@ tryCatch({{
 .wc_plot_png <- "{png_str}"
 .wc_plot_svg <- "{svg_str}"
 setHook("plot.new", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
+setHook("grid.newpage", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
 png(.wc_plot_png, width = 1600, height = 1200, res = 200)
 dev.control("enable")
 tryCatch({{
