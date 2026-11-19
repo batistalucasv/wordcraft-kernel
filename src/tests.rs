@@ -13,8 +13,8 @@ impl TempTestDir {
                 std::env::temp_dir().join(format!("{prefix}-{}-{attempt}", std::process::id()));
             match fs::create_dir(&path) {
                 Ok(()) => return Self { path },
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => panic!("create test dir {}: {e}", path.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create test dir {}: {error}", path.display()),
             }
         }
         panic!("could not create an exclusive test directory");
@@ -33,60 +33,69 @@ impl Drop for TempTestDir {
 
 #[test]
 fn code_language_parsing() {
-    assert_eq!("r".parse::<CodeLanguage>().unwrap(), CodeLanguage::R);
-    assert_eq!("R".parse::<CodeLanguage>().unwrap(), CodeLanguage::R);
-    assert_eq!(
-        "python".parse::<CodeLanguage>().unwrap(),
-        CodeLanguage::Python
-    );
-    assert_eq!("py".parse::<CodeLanguage>().unwrap(), CodeLanguage::Python);
-    assert_eq!(
-        "Python".parse::<CodeLanguage>().unwrap(),
-        CodeLanguage::Python
-    );
+    assert!(matches!("r".parse::<CodeLanguage>(), Ok(CodeLanguage::R)));
+    assert!(matches!("R".parse::<CodeLanguage>(), Ok(CodeLanguage::R)));
+    assert!(matches!(
+        "python".parse::<CodeLanguage>(),
+        Ok(CodeLanguage::Python)
+    ));
+    assert!(matches!(
+        "py".parse::<CodeLanguage>(),
+        Ok(CodeLanguage::Python)
+    ));
+    assert!(matches!(
+        "Python".parse::<CodeLanguage>(),
+        Ok(CodeLanguage::Python)
+    ));
     assert!("javascript".parse::<CodeLanguage>().is_err());
 }
 
 #[test]
 fn execution_request_defaults() {
-    let req = ExecutionRequest::new(CodeLanguage::Python, "print('hello')");
-    assert_eq!(req.language, CodeLanguage::Python);
-    assert_eq!(req.timeout_ms, 30_000);
-    assert!(req.capture_plots);
-    assert_eq!(req.plot_format, PlotFormat::Png);
-    assert_eq!(req.code, "print('hello')");
+    let request = ExecutionRequest::new(CodeLanguage::Python, "print('hello')");
+    assert_eq!(request.language, CodeLanguage::Python);
+    assert_eq!(request.timeout_ms, 30_000);
+    assert!(request.capture_plots);
+    assert_eq!(request.plot_format, PlotFormat::Png);
+    assert_eq!(request.code, "print('hello')");
+    assert!(request.supervisor_path.is_none());
 
-    let customized = req
+    let customized = request
         .with_timeout(5_000)
         .with_plot_capture(false)
         .with_plot_format(PlotFormat::Svg)
+        .with_supervisor_path("/tmp/wc-kernel-supervisor")
         .with_working_dir("/tmp");
     assert_eq!(customized.timeout_ms, 5_000);
     assert!(!customized.capture_plots);
     assert_eq!(customized.plot_format, PlotFormat::Svg);
     assert_eq!(customized.working_dir, Some(PathBuf::from("/tmp")));
+    assert_eq!(
+        customized.supervisor_path,
+        Some(PathBuf::from("/tmp/wc-kernel-supervisor"))
+    );
 }
 
 #[test]
-fn execution_request_deserialization_defaults_plot_options() {
+fn execution_request_deserialization_defaults_plot_options() -> Result<(), serde_json::Error> {
     let omitted =
         r#"{"language":"python","code":"print('hello')","timeout_ms":1000,"capture_plots":true}"#;
-    let request: ExecutionRequest = serde_json::from_str(omitted).expect("deserialize request");
+    let request: ExecutionRequest = serde_json::from_str(omitted)?;
     assert_eq!(request.plot_format, PlotFormat::Png);
     assert!(!request.prefer_svg);
+    assert!(request.supervisor_path.is_none());
 
     let explicit_format = r#"{"language":"python","code":"","timeout_ms":1000,"capture_plots":false,"plot_format":"svg"}"#;
-    let request: ExecutionRequest =
-        serde_json::from_str(explicit_format).expect("deserialize explicit format");
+    let request: ExecutionRequest = serde_json::from_str(explicit_format)?;
     assert_eq!(request.plot_format, PlotFormat::Svg);
     assert!(!request.prefer_svg);
 
     let explicit_preference = r#"{"language":"python","code":"","timeout_ms":1000,"capture_plots":false,"prefer_svg":true}"#;
-    let request: ExecutionRequest =
-        serde_json::from_str(explicit_preference).expect("deserialize explicit preference");
+    let request: ExecutionRequest = serde_json::from_str(explicit_preference)?;
     assert_eq!(request.plot_format, PlotFormat::Png);
     assert!(request.prefer_svg);
     assert_eq!(request.effective_plot_format(), PlotFormat::Svg);
+    Ok(())
 }
 
 #[test]
@@ -180,21 +189,6 @@ fn python_timeout_preserves_partial_stdout() {
 
     assert!(result.timed_out);
     assert!(result.stdout.contains("before timeout"));
-}
-
-#[test]
-fn capture_sink_caps_single_burst() {
-    let burst = vec![b'x'; MAX_CAPTURE_BYTES + 1024];
-    let (sink, _, reader) = spawn_capture(std::io::Cursor::new(burst), MAX_CAPTURE_BYTES)
-        .expect("start capture reader");
-
-    reader
-        .join()
-        .expect("capture reader must not panic")
-        .expect("capture reader must succeed");
-
-    assert!(sink.is_truncated());
-    assert_eq!(sink.text().len(), MAX_CAPTURE_BYTES);
 }
 
 #[test]
@@ -481,46 +475,43 @@ fn execution_request_prefer_svg() {
 #[test]
 fn effective_plot_format_combinations() {
     let base = ExecutionRequest::new(CodeLanguage::Python, "");
-
     assert_eq!(base.effective_plot_format(), PlotFormat::Png);
-
-    let svg_by_preference = base.clone().with_prefer_svg(true);
-    assert_eq!(svg_by_preference.effective_plot_format(), PlotFormat::Svg);
-
-    let both_with_preference = base
-        .clone()
-        .with_plot_format(PlotFormat::Both)
-        .with_prefer_svg(true);
     assert_eq!(
-        both_with_preference.effective_plot_format(),
+        base.clone().with_prefer_svg(true).effective_plot_format(),
+        PlotFormat::Svg
+    );
+    assert_eq!(
+        base.clone()
+            .with_plot_format(PlotFormat::Both)
+            .with_prefer_svg(true)
+            .effective_plot_format(),
         PlotFormat::Both
     );
-
-    let explicit_svg = base
-        .clone()
-        .with_prefer_svg(true)
-        .with_plot_format(PlotFormat::Svg)
-        .with_prefer_svg(false);
-    assert_eq!(explicit_svg.effective_plot_format(), PlotFormat::Svg);
-
-    let png_with_preference = base
-        .clone()
-        .with_plot_format(PlotFormat::Png)
-        .with_prefer_svg(true);
-    assert_eq!(png_with_preference.effective_plot_format(), PlotFormat::Svg);
+    assert_eq!(
+        base.clone()
+            .with_prefer_svg(true)
+            .with_plot_format(PlotFormat::Svg)
+            .with_prefer_svg(false)
+            .effective_plot_format(),
+        PlotFormat::Svg
+    );
+    assert_eq!(
+        base.with_plot_format(PlotFormat::Png)
+            .with_prefer_svg(true)
+            .effective_plot_format(),
+        PlotFormat::Svg
+    );
 }
 
 #[test]
 fn svg_completion_filter() {
     let body = "x".repeat(80);
-
     assert!(is_complete_svg(&format!("<svg>{body}</svg>")));
     assert!(is_complete_svg(&format!("<svg>{body}</svg>\n")));
     assert!(!is_complete_svg(&format!("<svg>{body}")));
     assert!(!is_complete_svg(&format!("<svg>{body}</svg")));
     assert!(!is_complete_svg("<svg></svg>"));
 }
-
 #[test]
 fn python_plot_png_capture() {
     if !python_has_matplotlib() {

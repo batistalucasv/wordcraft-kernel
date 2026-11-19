@@ -17,13 +17,11 @@ pub mod templates;
 
 use std::fmt;
 use std::fs;
-use std::io::{self, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use command_group::{CommandGroup, GroupChild};
@@ -168,11 +166,14 @@ pub struct ExecutionRequest {
     /// Whether SVG should be preferred over the default PNG capture.
     #[serde(default)]
     pub prefer_svg: bool,
-    /// Extra Python module search directories, prepended to `PYTHONPATH`.
+    /// Extra Python module search directories, prepended to Python's module search path.
     #[serde(default)]
     pub python_path: Vec<PathBuf>,
     /// Optional working directory.
     pub working_dir: Option<PathBuf>,
+    /// Optional path to the `wc-kernel-supervisor` helper executable.
+    #[serde(default)]
+    pub supervisor_path: Option<PathBuf>,
 }
 
 impl ExecutionRequest {
@@ -187,6 +188,7 @@ impl ExecutionRequest {
             prefer_svg: false,
             python_path: Vec::new(),
             working_dir: None,
+            supervisor_path: None,
         }
     }
 
@@ -237,6 +239,12 @@ impl ExecutionRequest {
         self.working_dir = Some(dir.into());
         self
     }
+
+    /// Set an explicit path to the `wc-kernel-supervisor` helper.
+    pub fn with_supervisor_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.supervisor_path = Some(path.into());
+        self
+    }
 }
 
 /// Result of executing a code chunk.
@@ -277,6 +285,9 @@ pub enum KernelError {
         language: CodeLanguage,
         binary: &'static str,
     },
+
+    #[error("The wc-kernel-supervisor helper was not found")]
+    SupervisorNotFound,
 
     #[error("I/O error during execution: {0}")]
     Io(String),
@@ -368,132 +379,96 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
         KernelError::ScriptPreparation(format!("write {}: {e}", user_file.display()))
     })?;
 
-    let wrapped_code = prepare_wrapped_code(request.language, request.capture_plots, plot_format);
+    let mut wrapped_code =
+        prepare_wrapped_code(request.language, request.capture_plots, plot_format);
+    if request.language == CodeLanguage::Python && !request.python_path.is_empty() {
+        let paths = request
+            .python_path
+            .iter()
+            .map(|path| python_path_expression(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let paths_literal = format!("[{}]", paths.join(","));
+        wrapped_code = format!(
+            "(lambda _wc_sys, _wc_paths: [_wc_sys.path.insert(0, _wc_path) for _wc_path in reversed(_wc_paths)])(__import__('sys'), {paths_literal})\n{wrapped_code}"
+        );
+    }
     fs::write(&script_file, wrapped_code.as_bytes()).map_err(|e| {
         KernelError::ScriptPreparation(format!("write {}: {e}", script_file.display()))
     })?;
 
-    let mut cmd = Command::new(&binary);
-    cmd.arg(&script_file);
-    match request.language {
-        CodeLanguage::R => {
-            cmd.env("WORDCRAFT_USER_SCRIPT", &user_file);
-            cmd.env("WORDCRAFT_TABLES_FILE", &tables_file);
-            cmd.env("WORDCRAFT_PLOT_PNG", &plot_png_path);
-            cmd.env("WORDCRAFT_PLOT_SVG", &plot_svg_path);
-        }
-        CodeLanguage::Python => {
-            cmd.arg(&user_file);
-            cmd.arg(&tables_file);
-            cmd.arg(&plot_png_path);
-            cmd.arg(&plot_svg_path);
-        }
+    let supervisor = find_supervisor_binary(request.supervisor_path.as_deref())?;
+    let result_file = temp_dir.join("__wordcraft_result__.bin");
+    let mut cmd = Command::new(&supervisor);
+    cmd.arg("--run")
+        .arg(&binary)
+        .arg(&script_file)
+        .arg(&result_file)
+        .arg(request.timeout_ms.to_string());
+    if request.language == CodeLanguage::R {
+        cmd.env("WORDCRAFT_USER_SCRIPT", &user_file)
+            .env("WORDCRAFT_TABLES_FILE", &tables_file)
+            .env("WORDCRAFT_PLOT_PNG", &plot_png_path)
+            .env("WORDCRAFT_PLOT_SVG", &plot_svg_path);
+    } else {
+        cmd.arg(&user_file)
+            .arg(&tables_file)
+            .arg(&plot_png_path)
+            .arg(&plot_svg_path);
     }
     cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
+    cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
 
     if let Some(ref dir) = request.working_dir {
         cmd.current_dir(dir);
     } else {
-        cmd.current_dir(temp_dir);
+        cmd.current_dir(&temp_dir);
     }
 
-    if request.language == CodeLanguage::Python && !request.python_path.is_empty() {
-        let mut paths = request.python_path.clone();
-        if let Some(existing) = std::env::var_os("PYTHONPATH") {
-            paths.extend(std::env::split_paths(&existing));
-        }
-        let joined = std::env::join_paths(&paths)
-            .map_err(|e| KernelError::Io(format!("build PYTHONPATH: {e}")))?;
-        cmd.env("PYTHONPATH", joined);
-    }
-
-    let start_time = Instant::now();
     let mut child = cmd
         .group_spawn()
-        .map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?;
-
-    let stdout_pipe = child.inner().stdout.take();
-    let stderr_pipe = child.inner().stderr.take();
-    let (Some(stdout_pipe), Some(stderr_pipe)) = (stdout_pipe, stderr_pipe) else {
-        let cleanup = terminate_process_group(&mut child)
-            .err()
-            .map(|error| format!("; stop process group: {error}"))
-            .unwrap_or_default();
-        return Err(KernelError::Io(format!(
-            "interpreter output pipes were not created{cleanup}"
-        )));
+        .map_err(|e| KernelError::Io(format!("spawn supervisor {}: {e}", supervisor.display())))?;
+    let supervisor_timeout =
+        Duration::from_millis(request.timeout_ms).saturating_add(Duration::from_secs(5));
+    let status = match wait_for_supervisor(&mut child, supervisor_timeout) {
+        Ok(status) => status,
+        Err(error) => {
+            let cleanup = terminate_supervisor_process_group(&mut child)
+                .err()
+                .map(|cleanup| format!("; cleanup failed: {cleanup}"))
+                .unwrap_or_default();
+            let stderr = read_supervisor_stderr(&mut child).map_err(|read_error| {
+                KernelError::Io(format!(
+                    "supervisor failed: {error}{cleanup}; read diagnostics: {read_error}"
+                ))
+            })?;
+            return Err(KernelError::Io(format!(
+                "supervisor failed: {error}{cleanup}{}",
+                if stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", stderr.trim())
+                }
+            )));
+        }
     };
-
-    if let Err(e) =
-        set_pipe_nonblocking(&stdout_pipe).and_then(|()| set_pipe_nonblocking(&stderr_pipe))
-    {
-        let cleanup = terminate_process_group(&mut child)
-            .err()
-            .map(|error| format!("; stop process group: {error}"))
-            .unwrap_or_default();
+    let stderr = read_supervisor_stderr(&mut child)
+        .map_err(|e| KernelError::Io(format!("read supervisor diagnostics: {e}")))?;
+    if !status.success() {
         return Err(KernelError::Io(format!(
-            "configure output capture pipes: {e}{cleanup}"
+            "supervisor exited with {status}{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr.trim())
+            }
         )));
     }
-
-    let (stdout_sink, stdout_cancel, stdout_reader) =
-        match spawn_capture(stdout_pipe, MAX_CAPTURE_BYTES) {
-            Ok(reader) => reader,
-            Err(e) => {
-                let cleanup = terminate_process_group(&mut child)
-                    .err()
-                    .map(|cleanup| format!("; stop process group: {cleanup}"))
-                    .unwrap_or_default();
-                return Err(KernelError::Io(format!(
-                    "start stdout capture: {e}{cleanup}"
-                )));
-            }
-        };
-    let (stderr_sink, stderr_cancel, stderr_reader) =
-        match spawn_capture(stderr_pipe, MAX_CAPTURE_BYTES) {
-            Ok(reader) => reader,
-            Err(e) => {
-                let cleanup = terminate_process_group(&mut child)
-                    .err()
-                    .map(|cleanup| format!("; stop process group: {cleanup}"))
-                    .unwrap_or_default();
-                stdout_cancel.store(true, Ordering::Release);
-                let reader_cleanup = join_capture_reader(stdout_reader, "stdout")
-                    .err()
-                    .map(|cleanup| format!("; finish stdout capture: {cleanup}"))
-                    .unwrap_or_default();
-                return Err(KernelError::Io(format!(
-                    "start stderr capture: {e}{cleanup}{reader_cleanup}"
-                )));
-            }
-        };
-
-    let outcome = wait_with_timeout(
-        &mut child,
-        Duration::from_millis(request.timeout_ms),
-        &stdout_sink,
-        &stderr_sink,
-    );
-    let duration_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
-
-    // Terminate remaining group members, then cancel readers that still see
-    // open pipe writers outside the group.
-    let stop_result = terminate_process_group(&mut child);
-    stdout_cancel.store(true, Ordering::Release);
-    stderr_cancel.store(true, Ordering::Release);
-    let stdout_result = join_capture_reader(stdout_reader, "stdout");
-    let stderr_result = join_capture_reader(stderr_reader, "stderr");
-    let outcome = outcome.map_err(|e| KernelError::Io(format!("wait for interpreter: {e}")))?;
-    stop_result.map_err(|e| KernelError::Io(format!("stop interpreter process group: {e}")))?;
-    stdout_result?;
-    stderr_result?;
-
-    let stdout = stdout_sink.text();
-    let stderr = stderr_sink.text();
-    let output_truncated =
-        outcome.output_limited || stdout_sink.is_truncated() || stderr_sink.is_truncated();
+    let outcome = read_supervisor_result(&result_file)
+        .map_err(|e| KernelError::Io(format!("read supervisor result: {e}")))?;
+    let stdout = outcome.stdout;
+    let stderr = outcome.stderr;
+    let output_truncated = outcome.output_truncated;
 
     let mut plot_png = None;
     if request.capture_plots && plot_format.captures_png() && plot_png_path.is_file() {
@@ -513,194 +488,226 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
 
     drop(_guard);
 
-    let exit_code = outcome.status.and_then(|s| s.code());
-    let success = outcome.status.map(|s| s.success()).unwrap_or(false) && !outcome.timed_out;
-
     Ok(ExecutionResult {
         stdout,
         stderr,
-        exit_code,
-        success,
+        exit_code: outcome.exit_code,
+        success: outcome.success,
         timed_out: outcome.timed_out,
         output_truncated,
         plot_png,
         plot_svg,
         tables,
-        duration_ms,
+        duration_ms: outcome.duration_ms,
     })
 }
 
-/// Bounded capture buffer filled by a reader thread.
-#[derive(Clone)]
-struct CaptureSink {
-    bytes: Arc<Mutex<Vec<u8>>>,
-    truncated: Arc<AtomicBool>,
-}
-
-impl CaptureSink {
-    fn new() -> Self {
-        Self {
-            bytes: Arc::new(Mutex::new(Vec::new())),
-            truncated: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    fn is_truncated(&self) -> bool {
-        self.truncated.load(Ordering::Relaxed)
-    }
-
-    fn text(&self) -> String {
-        let bytes = self
-            .bytes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        String::from_utf8_lossy(&bytes).into_owned()
-    }
-}
-
-/// Drain a child stream into a capped buffer.
-///
-/// Once `limit` bytes are kept, the read end is dropped so further writes fail
-/// instead of growing the capture.
-fn spawn_capture<R>(
-    mut pipe: R,
-    limit: usize,
-) -> io::Result<(CaptureSink, Arc<AtomicBool>, JoinHandle<io::Result<()>>)>
-where
-    R: Read + Send + 'static,
-{
-    let sink = CaptureSink::new();
-    let thread_sink = sink.clone();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let thread_cancel = Arc::clone(&cancel);
-    let reader = thread::Builder::new()
-        .name("wordcraft-output-capture".to_string())
-        .spawn(move || -> io::Result<()> {
-            let mut chunk = [0u8; 8192];
-            loop {
-                match pipe.read(&mut chunk) {
-                    Ok(0) => return Ok(()),
-                    Ok(read) => {
-                        let mut bytes = thread_sink
-                            .bytes
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let remaining = limit.saturating_sub(bytes.len());
-                        if read > remaining {
-                            bytes.extend_from_slice(&chunk[..remaining]);
-                            drop(bytes);
-                            thread_sink.truncated.store(true, Ordering::Relaxed);
-                            return Ok(());
-                        }
-                        bytes.extend_from_slice(&chunk[..read]);
-                    }
-                    Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if thread_cancel.load(Ordering::Acquire) {
-                            return Ok(());
-                        }
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        })?;
-    Ok((sink, cancel, reader))
+struct SupervisorResult {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    success: bool,
+    timed_out: bool,
+    output_truncated: bool,
+    duration_ms: u64,
 }
 
 #[cfg(unix)]
-fn set_pipe_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
-    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+fn python_path_expression(path: &Path) -> Result<String, KernelError> {
+    use std::os::unix::ffi::OsStrExt;
 
-    let flags = fcntl(pipe.as_raw_fd(), FcntlArg::F_GETFL).map_err(io::Error::other)?;
-    let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
-    fcntl(pipe.as_raw_fd(), FcntlArg::F_SETFL(flags))
-        .map(|_| ())
-        .map_err(io::Error::other)
+    let hex = path
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("");
+    Ok(format!("__import__('os').fsdecode(bytes.fromhex('{hex}'))"))
 }
 
-#[cfg(not(unix))]
-fn set_pipe_nonblocking(_pipe: &impl Read) -> io::Result<()> {
-    Ok(())
+#[cfg(windows)]
+fn python_path_expression(path: &Path) -> Result<String, KernelError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let bytes = path
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("");
+    Ok(format!(
+        "bytes.fromhex('{hex}').decode('utf-16-le', 'surrogatepass')"
+    ))
 }
 
-fn join_capture_reader(
-    reader: JoinHandle<io::Result<()>>,
-    stream: &str,
-) -> Result<(), KernelError> {
-    match reader.join() {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(KernelError::Io(format!("read {stream} capture: {e}"))),
-        Err(_) => Err(KernelError::Io(format!("{stream} capture thread panicked"))),
+#[cfg(not(any(unix, windows)))]
+fn python_path_expression(path: &Path) -> Result<String, KernelError> {
+    path.to_str()
+        .ok_or_else(|| KernelError::Io("Python module path is not valid UTF-8".to_string()))
+        .and_then(|path| {
+            serde_json::to_string(path)
+                .map_err(|error| KernelError::Io(format!("encode Python module path: {error}")))
+        })
+}
+
+fn find_supervisor_binary(configured: Option<&Path>) -> Result<PathBuf, KernelError> {
+    if let Some(path) = configured {
+        return if path.is_file() {
+            fs::canonicalize(path)
+                .map_err(|error| KernelError::Io(format!("resolve supervisor path: {error}")))
+        } else {
+            Err(KernelError::Io(format!(
+                "configured supervisor {} does not exist",
+                path.display()
+            )))
+        };
     }
-}
 
-struct WaitOutcome {
-    status: Option<std::process::ExitStatus>,
-    timed_out: bool,
-    output_limited: bool,
-}
+    let executable_name = if cfg!(windows) {
+        "wc-kernel-supervisor.exe"
+    } else {
+        "wc-kernel-supervisor"
+    };
 
-/// Wait for the child until timeout or a capture limit is reached.
-fn wait_with_timeout(
-    child: &mut GroupChild,
-    timeout: Duration,
-    stdout_sink: &CaptureSink,
-    stderr_sink: &CaptureSink,
-) -> io::Result<WaitOutcome> {
-    let start = Instant::now();
-    let step = Duration::from_millis(10);
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return Ok(WaitOutcome {
-                    status: Some(status),
-                    timed_out: false,
-                    output_limited: false,
-                });
-            }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    return Ok(WaitOutcome {
-                        status: None,
-                        timed_out: true,
-                        output_limited: stdout_sink.is_truncated() || stderr_sink.is_truncated(),
-                    });
-                }
-                if stdout_sink.is_truncated() || stderr_sink.is_truncated() {
-                    return Ok(WaitOutcome {
-                        status: child.try_wait()?,
-                        timed_out: false,
-                        output_limited: true,
-                    });
-                }
-                std::thread::sleep(step);
-            }
-            Err(error) => return Err(error),
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(directory) = current_exe.parent()
+    {
+        let candidate = directory.join(executable_name);
+        if candidate.is_file() {
+            return fs::canonicalize(candidate).map_err(|error| {
+                KernelError::Io(format!(
+                    "resolve supervisor beside current executable: {error}"
+                ))
+            });
         }
     }
+
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(executable_name);
+            if candidate.is_file() {
+                return fs::canonicalize(candidate).map_err(|error| {
+                    KernelError::Io(format!("resolve supervisor from PATH: {error}"))
+                });
+            }
+        }
+    }
+
+    Err(KernelError::SupervisorNotFound)
 }
 
-/// Stop the interpreter and any descendants managed by its process group.
-fn terminate_process_group(child: &mut GroupChild) -> io::Result<Option<ExitStatus>> {
-    let status = child.try_wait();
+fn wait_for_supervisor(
+    child: &mut GroupChild,
+    timeout: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if start.elapsed() >= timeout {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "supervisor exceeded its cleanup deadline",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn terminate_supervisor_process_group(child: &mut GroupChild) -> std::io::Result<()> {
     match child.kill() {
-        Ok(()) => child.wait().map(Some),
-        Err(kill_error) => match status {
-            Ok(Some(_)) => child.wait().map(Some),
-            Ok(None) => match child.try_wait() {
-                Ok(Some(_)) => child.wait().map(Some),
-                Ok(None) => Err(kill_error),
-                Err(wait_error) => Err(io::Error::other(format!(
-                    "kill process group: {kill_error}; check child status: {wait_error}"
-                ))),
-            },
-            Err(wait_error) => Err(io::Error::other(format!(
-                "kill process group: {kill_error}; check child status: {wait_error}"
+        Ok(()) => child.wait().map(|_| ()),
+        Err(kill_error) => match child.try_wait() {
+            Ok(Some(_)) => child.wait().map(|_| ()),
+            Ok(None) => Err(kill_error),
+            Err(wait_error) => Err(std::io::Error::other(format!(
+                "kill supervisor: {kill_error}; check process status: {wait_error}"
             ))),
         },
     }
+}
+
+fn read_supervisor_stderr(child: &mut GroupChild) -> std::io::Result<String> {
+    let Some(stderr) = child.inner().stderr.take() else {
+        return Ok(String::new());
+    };
+    let mut bytes = Vec::new();
+    stderr.take(4096).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn read_supervisor_result(path: &Path) -> std::io::Result<SupervisorResult> {
+    const HEADER_LEN: usize = 25;
+    const MAGIC: &[u8; 4] = b"WCK1";
+
+    let mut file = fs::File::open(path)?;
+    let mut header = [0_u8; HEADER_LEN];
+    file.read_exact(&mut header)?;
+    if &header[..4] != MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid supervisor result header",
+        ));
+    }
+
+    let flags = header[4];
+    if flags & !0b11 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid supervisor result flags",
+        ));
+    }
+    let raw_exit_code =
+        i32::from_le_bytes(header[5..9].try_into().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid exit code")
+        })?);
+    let duration_ms =
+        u64::from_le_bytes(header[9..17].try_into().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid duration")
+        })?);
+    let stdout_len = u32::from_le_bytes(header[17..21].try_into().map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid stdout length")
+    })?) as usize;
+    let stderr_len = u32::from_le_bytes(header[21..25].try_into().map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid stderr length")
+    })?) as usize;
+
+    if stdout_len > MAX_CAPTURE_BYTES || stderr_len > MAX_CAPTURE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "supervisor result exceeds the output limit",
+        ));
+    }
+
+    let mut stdout = vec![0_u8; stdout_len];
+    let mut stderr = vec![0_u8; stderr_len];
+    file.read_exact(&mut stdout)?;
+    file.read_exact(&mut stderr)?;
+    let mut trailing = [0_u8; 1];
+    if file.read(&mut trailing)? != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "supervisor result has trailing data",
+        ));
+    }
+
+    let exit_code = (raw_exit_code != i32::MIN).then_some(raw_exit_code);
+    let timed_out = flags & 1 != 0;
+    Ok(SupervisorResult {
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        exit_code,
+        success: exit_code == Some(0) && !timed_out,
+        timed_out,
+        output_truncated: flags & 2 != 0,
+        duration_ms,
+    })
 }
 
 /// Whether `content` is a non-trivial and complete SVG document.
