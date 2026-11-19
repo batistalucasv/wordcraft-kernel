@@ -2,6 +2,35 @@
 
 use super::*;
 
+struct TempTestDir {
+    path: PathBuf,
+}
+
+impl TempTestDir {
+    fn create(prefix: &str) -> Self {
+        for attempt in 0..64 {
+            let path =
+                std::env::temp_dir().join(format!("{prefix}-{}-{attempt}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self { path },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create test dir {}: {e}", path.display()),
+            }
+        }
+        panic!("could not create an exclusive test directory");
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempTestDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 #[test]
 fn code_language_parsing() {
     assert_eq!("r".parse::<CodeLanguage>().unwrap(), CodeLanguage::R);
@@ -177,21 +206,18 @@ fn python_path_is_used_for_module_lookup() {
         return;
     }
 
-    let helper_dir = std::env::temp_dir().join(format!("wc-python-path-{}", std::process::id()));
-    fs::create_dir_all(&helper_dir).expect("create helper dir");
-    fs::write(helper_dir.join("wc_helper.py"), "VALUE = 42\n").expect("write helper module");
+    let helper_dir = TempTestDir::create("wc-python-path");
+    fs::write(helper_dir.path().join("wc_helper.py"), "VALUE = 42\n").expect("write helper module");
 
     let req = ExecutionRequest::new(
         CodeLanguage::Python,
         "import wc_helper\nprint(wc_helper.VALUE)",
     )
-    .with_python_path(&helper_dir);
+    .with_python_path(helper_dir.path());
     let result = execute(&req).expect("execution failed");
 
     assert!(result.success);
     assert_eq!(result.stdout.trim(), "42");
-
-    let _ = fs::remove_dir_all(&helper_dir);
 }
 
 #[test]

@@ -13,9 +13,16 @@ struct TestDir {
 
 impl TestDir {
     fn new(prefix: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
-        fs::create_dir_all(&path).expect("create temp dir");
-        Self { path }
+        for attempt in 0..64 {
+            let path =
+                std::env::temp_dir().join(format!("{prefix}-{}-{attempt}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self { path },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create temp dir {}: {e}", path.display()),
+            }
+        }
+        panic!("could not create an exclusive temp dir");
     }
 
     fn join(&self, name: &str) -> PathBuf {

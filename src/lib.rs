@@ -457,7 +457,7 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
 /// Create an owner-only capture file for a child stream.
 fn create_capture_file(path: &Path) -> std::io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -471,6 +471,7 @@ fn read_capture(path: &Path) -> String {
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default()
 }
+
 /// Wait for child process with timeout. Kills the child if timeout is reached.
 fn wait_with_timeout(
     child: &mut Child,
