@@ -17,6 +17,7 @@ Developed specifically for research in **Ecology**, statistical data science, an
   - Configurable via `PlotFormat::Png`, `PlotFormat::Svg`, and `PlotFormat::Both`.
   - `with_prefer_svg(true)` upgrades the default PNG capture to SVG; an explicit `PlotFormat::Both` is preserved.
 - **Clean Output Streams:** Strict separation of standard output (`stdout`), standard error (`stderr`), exit codes, and elapsed execution time.
+- **Persistent Sessions:** A `SessionManager` keeps one background R or Python daemon per `session_id`, so datasets loaded by one chunk stay in memory for the next chunk. Sessions can be restarted, closed, and expire automatically when idle.
 - **Template Library:** Ready-to-run, commented ecology and statistics snippets for R and Python, described in `templates`.
 - **Standalone CLI (`wc-kernel`):** Command-line binary for direct terminal execution, inspection, piped scripts, and JSON integration with external tools.
 
@@ -236,6 +237,68 @@ if let Ok(result) = execute(&ExecutionRequest::new(CodeLanguage::R, code)) {
 Both writers are bounded: at most 16 tables per run, 10,000 rows and 256 columns per
 table, 4,096 characters per cell, and 250,000 total cells. A malformed or oversized payload
 yields no tables instead of an error.
+
+---
+
+## Persistent Sessions
+
+`execute` starts a fresh interpreter for every call, which is the right default
+for an isolated preview. A document with several chunks usually wants the
+opposite: load the dataset once, then keep working on it. `SessionManager` keeps
+one daemon per `session_id` for that.
+
+```rust
+use std::time::Duration;
+use wordcraft_kernel::{CodeLanguage, ExecutionRequest, SessionManager};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut sessions = SessionManager::new().with_idle_timeout(Duration::from_secs(600));
+
+    // Chunk 1: load data from current working directory
+    let load = ExecutionRequest::new(
+        CodeLanguage::R,
+        r#"data <- read.csv("abundance.csv")
+           total <- sum(data$count)"#,
+    )
+    .with_working_dir(".");
+
+    let res1 = sessions.execute("field-study", &load)?;
+    if !res1.success {
+        eprintln!("Failed to load dataset: {}", res1.stderr);
+        return Ok(());
+    }
+
+    // Chunk 2: the dataset and `total` variable remain available in memory
+    let summary = ExecutionRequest::new(CodeLanguage::R, "cat('Total:', total, '\n')");
+    let res2 = sessions.execute("field-study", &summary)?;
+    println!("{}", res2.stdout);
+
+    // Chunk 3: restart the session to clear memory and start fresh
+    sessions.restart_session("field-study")?;
+
+    // Optional: reclaim idle daemons explicitly instead of waiting for automatic reap
+    let reaped = sessions.reap_idle_sessions();
+    println!("Reaped {reaped} idle session(s)");
+    Ok(())
+}
+```
+
+Rules that apply to session code:
+
+- The daemon keeps its global environment, imports and working directory between
+  chunks. A failed chunk leaves the session alive, and later chunks can inspect
+  whatever the failed chunk had already assigned.
+- Chunks must not read standard input: stdin carries length-prefixed IPC protocol payloads.
+  The Python driver isolates `sys.stdin` with an empty stream while a chunk runs.
+- Subprocess output from user code is redirected to chunk output files, isolating the
+  protocol stream from spawned child processes.
+- A chunk that exceeds `timeout_ms` terminates the daemon process tree; the call returns
+  `timed_out` and the next call for that id starts a fresh interpreter.
+- Session ids belong to one language. Reusing an id with another language
+  returns `KernelError::SessionLanguageMismatch`.
+- `idle_timeout` defaults to ten minutes. A zero timeout disables reaping. Idle
+  sessions are also reaped on every `execute`; call `reap_idle_sessions` if the
+  host has its own timer.
 
 ---
 
