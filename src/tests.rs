@@ -28,10 +28,12 @@ fn execution_request_defaults() {
     let customized = req
         .with_timeout(5_000)
         .with_plot_capture(false)
-        .with_plot_format(PlotFormat::Svg);
+        .with_plot_format(PlotFormat::Svg)
+        .with_working_dir("/tmp");
     assert_eq!(customized.timeout_ms, 5_000);
     assert!(!customized.capture_plots);
     assert_eq!(customized.plot_format, PlotFormat::Svg);
+    assert_eq!(customized.working_dir, Some(PathBuf::from("/tmp")));
 }
 
 #[test]
@@ -49,6 +51,30 @@ fn python_basic_execution() {
     assert!(!result.timed_out);
     assert!(result.plot_png.is_none());
     assert!(result.plot_svg.is_none());
+}
+
+#[test]
+fn python_working_dir_execution() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    let temp_dir = std::env::temp_dir();
+    let req = ExecutionRequest::new(
+        CodeLanguage::Python,
+        "import os\nprint(os.path.realpath(os.getcwd()))",
+    )
+    .with_working_dir(&temp_dir);
+    let result = execute(&req).expect("execution failed");
+
+    assert!(result.success);
+    let expected_dir = fs::canonicalize(&temp_dir).expect("canonical temp dir");
+    assert!(
+        result
+            .stdout
+            .trim()
+            .contains(expected_dir.to_str().expect("valid utf8"))
+    );
 }
 
 #[test]
