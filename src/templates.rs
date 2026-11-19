@@ -283,13 +283,18 @@ rownames(community) <- sprintf("unit_%02d", seq_len(n_units))
 colnames(community) <- sprintf("sp_%02d", seq_len(n_species))
 
 # Randomised (permutation-based) species accumulation with a 95% confidence
-# envelope. Use method = "exact" instead to get Mao's tau estimator.
+# envelope: each point is the mean over `permutations` orderings of the units.
 accumulation <- specaccum(
   community,
   method = "random",
   permutations = {{permutations}}
 )
 print(accumulation)
+
+# Hurlbert's rarefaction curve: expected richness in a subsample of each size,
+# which compares units at equal sampling effort. Interpolation only.
+rarefaction <- specaccum(community, method = "rarefaction")
+print(rarefaction)
 
 # Chao's estimator of the asymptotic species pool.
 pool <- specpool(community)
@@ -303,6 +308,14 @@ plot(
   col = "#4E79A7",
   ci.type = "poly",
   ci.col = adjustcolor("#4E79A7", alpha.f = 0.25)
+)
+lines(rarefaction, col = "#E15759", lty = 2)
+legend(
+  "bottomright",
+  legend = c("Accumulation (randomised)", "Rarefaction (Hurlbert)"),
+  col = c("#4E79A7", "#E15759"),
+  lty = c(1, 2),
+  bty = "n"
 )
 "##;
 
@@ -573,7 +586,7 @@ static TEMPLATES: &[Template] = &[
     Template {
         id: "r.species-accumulation",
         title: "Species accumulation and rarefaction",
-        description: "Permutation-based species accumulation curve with a confidence envelope.",
+        description: "Randomised species accumulation with a confidence envelope, plus Hurlbert's rarefaction curve.",
         language: CodeLanguage::R,
         category: TemplateCategory::Accumulation,
         requires: &["vegan"],

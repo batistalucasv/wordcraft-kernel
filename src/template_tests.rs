@@ -197,6 +197,26 @@ fn every_template_renders_with_its_defaults() {
 }
 
 #[test]
+fn species_accumulation_template_computes_both_curves() {
+    let template = templates::find("r.species-accumulation").expect("built-in template");
+    let rendered = template.render_default().expect("default render");
+
+    // The template promises accumulation and rarefaction, so both must run.
+    assert!(
+        rendered.contains(r#"method = "random""#),
+        "the accumulation curve is missing"
+    );
+    assert!(
+        rendered.contains(r#"method = "rarefaction""#),
+        "the rarefaction curve is missing"
+    );
+    assert!(
+        rendered.contains("lines(rarefaction"),
+        "the rarefaction curve is not drawn"
+    );
+}
+
+#[test]
 fn overrides_replace_only_the_named_placeholder() {
     let template = templates::find("r.shannon-simpson").expect("built-in template");
     let rendered = template
