@@ -835,6 +835,7 @@ line, = ax.plot([1, 2, 3], [1, 2, 3])
     // Second chunk modifies the existing line artist in-place without calling plt.figure or plot
     let code2 = r#"
 line.set_ydata([3, 2, 1])
+fig.canvas.draw()
 "#;
     let req2 = ExecutionRequest::new(CodeLanguage::Python, code2).with_plot_capture(true);
     let res2 = manager.execute("py-inplace", &req2).expect("chunk 2");
@@ -855,6 +856,40 @@ line.set_ydata([3, 2, 1])
     );
 
     manager.close_session("py-inplace");
+}
+
+#[test]
+fn python_plot_callbacks_write_to_chunk_output() {
+    if !python_has_matplotlib() {
+        return;
+    }
+    let Some(mut manager) = manager_for(CodeLanguage::Python) else {
+        return;
+    };
+
+    let code = r#"
+import sys
+import matplotlib.pyplot as plt
+fig, ax = plt.subplots()
+ax.plot([1, 2], [3, 4])
+def on_draw(event):
+    print("plot callback stdout")
+    print("plot callback stderr", file=sys.stderr)
+fig.canvas.mpl_connect("draw_event", on_draw)
+"#;
+    let req = ExecutionRequest::new(CodeLanguage::Python, code)
+        .with_plot_capture(true)
+        .with_plot_format(PlotFormat::Png);
+    let result = manager
+        .execute("py-plot-callback", &req)
+        .expect("execute plot");
+
+    assert!(result.success, "stderr: {}", result.stderr);
+    assert!(result.plot_png.is_some(), "plot should be captured");
+    assert!(result.stdout.contains("plot callback stdout"));
+    assert!(result.stderr.contains("plot callback stderr"));
+
+    manager.close_session("py-plot-callback");
 }
 
 #[test]
@@ -897,7 +932,9 @@ fn r_subprocess_output_without_newline_does_not_corrupt_protocol() {
     };
 
     let code = r#"
+cat("before-subprocess\n")
 system("printf 'partial-line-output'")
+cat("\nafter-subprocess\n")
 "#;
     let res = manager
         .execute("r-subp", &chunk(CodeLanguage::R, code))
@@ -908,6 +945,26 @@ system("printf 'partial-line-output'")
         "stdout should contain partial-line-output, got: {:?}",
         res.stdout
     );
+    let before = res.stdout.find("before-subprocess").expect("before output");
+    let subprocess = res
+        .stdout
+        .find("partial-line-output")
+        .expect("subprocess output");
+    let after = res.stdout.find("after-subprocess").expect("after output");
+    assert!(
+        before < subprocess && subprocess < after,
+        "stdout order was: {:?}",
+        res.stdout
+    );
+
+    let binary = manager
+        .execute(
+            "r-subp",
+            &chunk(CodeLanguage::R, r#"system("printf '\\377'")"#),
+        )
+        .expect("exec non-UTF-8 subp");
+    assert!(binary.success, "stderr: {}", binary.stderr);
+    assert!(binary.stdout.contains('\u{fffd}'));
 
     // Follow-up chunk confirms session is healthy and responsive
     let res2 = manager
@@ -1084,6 +1141,20 @@ fn large_output_sets_truncated_flag_and_bounds_memory() {
         crate::session::MAX_STREAM_BYTES
     );
 
+    let invalid_utf8 = ExecutionRequest::new(
+        CodeLanguage::Python,
+        "import sys\nsys.stdout.buffer.write(b'\\xff' * (5 * 1024 * 1024))",
+    );
+    let invalid_result = manager
+        .execute("large-out", &invalid_utf8)
+        .expect("invalid UTF-8 output");
+    assert!(invalid_result.success, "stderr: {}", invalid_result.stderr);
+    assert!(
+        invalid_result.output_truncated,
+        "lossy UTF-8 expansion must be reported as truncation"
+    );
+    assert!(invalid_result.stdout.len() <= crate::session::MAX_STREAM_BYTES);
+
     // Follow-up execution should work cleanly
     let req2 = chunk(CodeLanguage::Python, "print('clean')");
     let res2 = manager.execute("large-out", &req2).expect("clean");
@@ -1245,6 +1316,34 @@ fn r_session_dispatches_s3_print_from_globalenv() {
     );
 
     manager.close_session("r-s3");
+}
+
+#[test]
+fn r_automatic_print_uses_base_generic_when_global_print_is_shadowed() {
+    let Some(mut manager) = manager_for(CodeLanguage::R) else {
+        return;
+    };
+
+    let define_shadow = chunk(
+        CodeLanguage::R,
+        "print <- function(x, required) stop('shadowed print called')",
+    );
+    let defined = manager
+        .execute("r-print-shadow", &define_shadow)
+        .expect("define shadowed print");
+    assert!(defined.success, "stderr: {}", defined.stderr);
+
+    let visible = manager
+        .execute("r-print-shadow", &chunk(CodeLanguage::R, "42"))
+        .expect("automatically print visible value");
+    assert!(visible.success, "stderr: {}", visible.stderr);
+    assert!(
+        visible.stdout.contains("42"),
+        "stdout was: {:?}",
+        visible.stdout
+    );
+
+    manager.close_session("r-print-shadow");
 }
 
 #[test]

@@ -2,9 +2,9 @@
 //!
 //! [`SessionManager`] keeps one long-lived R or Python process per
 //! `session_id`, so a value created by one code chunk is still in memory when a
-//! later chunk runs. Each process is a background daemon driven through its own
-//! stdin/stdout pipes; user output goes to files, never to the pipe, so a chunk
-//! that prints or fails cannot corrupt the protocol.
+//! later chunk runs. Each process is a background daemon with an isolated
+//! protocol channel (Python stdin/stdout or an authenticated R socket); user
+//! output is captured separately so it cannot corrupt the protocol.
 //!
 //! # Wire protocol
 //!
@@ -23,13 +23,14 @@
 //! The daemon evaluates the code in its execution environment, writes
 //! `out-<seq>.txt`, `err-<seq>.txt`, `status-<seq>.txt` and, when a plot was
 //! drawn, `plot-<seq>.png` / `plot-<seq>.svg` in its private temporary
-//! directory, then prints `END <seq>\n` on its dedicated protocol stdout descriptor.
+//! directory, then sends `END <seq>\n` over its dedicated protocol channel
+//! (Python stdout or the authenticated R socket).
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -379,6 +380,7 @@ struct Session {
     pgid: Mutex<Option<u32>>,
     input: Option<SessionInput>,
     lines: Receiver<Option<String>>,
+    stdout_capture: Option<PathBuf>,
     temp_dir: PathBuf,
     last_used: Instant,
     seq: u64,
@@ -442,6 +444,64 @@ fn generate_auth_token() -> String {
             .unwrap_or(0),
         SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+fn read_auth_line(
+    stream: &mut std::net::TcpStream,
+    expected: &[u8],
+    deadline: Instant,
+) -> std::io::Result<bool> {
+    stream.set_nonblocking(true)?;
+    let mut line = Vec::with_capacity(64);
+    let mut buffer = [0u8; 64];
+
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+
+        match stream.read(&mut buffer) {
+            Ok(0) => return Ok(false),
+            Ok(read) => {
+                if Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                let bytes = &buffer[..read];
+                let line_end = bytes.iter().position(|byte| *byte == b'\n');
+                let bytes_before_newline = line_end.map_or(bytes, |end| &bytes[..end]);
+                if line.len().saturating_add(bytes_before_newline.len()) > 256 {
+                    return Ok(false);
+                }
+                line.extend_from_slice(bytes_before_newline);
+
+                if line_end.is_some() {
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                    return Ok(line == expected);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(false);
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 impl Session {
@@ -541,7 +601,7 @@ impl Session {
             .map_err(|e| KernelError::Io(format!("create {}: {e}", stderr_path.display())))?;
 
         let mut command = Command::new(binary);
-        let (mut child, input) = match language {
+        let (mut child, input, protocol_socket, stdout_capture) = match language {
             CodeLanguage::Python => {
                 command.arg("-u");
                 command
@@ -570,7 +630,7 @@ impl Session {
                         "interpreter stdin pipe was not created".to_string(),
                     )
                 })?;
-                (child, Some(SessionInput::Pipe(stdin)))
+                (child, Some(SessionInput::Pipe(stdin)), None, None)
             }
             CodeLanguage::R => {
                 let listener = std::net::TcpListener::bind("127.0.0.1:0")
@@ -583,13 +643,21 @@ impl Session {
                 let auth_token = generate_auth_token();
                 let auth_path = temp_dir.join("auth.txt");
                 let _ = fs::write(&auth_path, &auth_token);
+                let stdout_path = temp_dir.join("driver-stdout.txt");
+                let stdout_file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&stdout_path)
+                    .map_err(|e| {
+                        KernelError::Io(format!("create {}: {e}", stdout_path.display()))
+                    })?;
 
                 command
                     .arg(&driver_path)
                     .arg(temp_dir)
                     .arg(port.to_string())
                     .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
+                    .stdout(Stdio::from(stdout_file))
                     .stderr(Stdio::from(stderr_file))
                     .current_dir(temp_dir)
                     .env("TMPDIR", temp_dir)
@@ -612,32 +680,29 @@ impl Session {
                 listener
                     .set_nonblocking(true)
                     .map_err(|e| KernelError::Io(format!("set nonblocking on R listener: {e}")))?;
-                let start = Instant::now();
+                let deadline = Instant::now() + Duration::from_secs(15);
                 let expected_auth = format!("AUTH {auth_token}");
 
                 let stream = loop {
-                    let elapsed = start.elapsed();
-                    if elapsed > Duration::from_secs(15) {
+                    if Instant::now() >= deadline {
                         return Err(KernelError::SessionTerminated {
                             session_id: session_id.to_string(),
                             detail: "timeout waiting for R driver to connect".to_string(),
                         });
                     }
-                    let remaining = Duration::from_secs(15).saturating_sub(elapsed);
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            stream.set_nonblocking(false).map_err(|e| {
-                                KernelError::Io(format!("set blocking on R socket: {e}"))
-                            })?;
-                            let read_timeout = remaining.min(Duration::from_secs(5));
-                            let _ = stream.set_read_timeout(Some(read_timeout));
-                            let mut auth_reader = BufReader::new(&mut stream);
-                            let mut auth_line = String::new();
-                            let mut take_auth = (&mut auth_reader).take(256);
-                            let auth_ok = take_auth.read_line(&mut auth_line).is_ok()
-                                && auth_line.trim() == expected_auth;
-                            let _ = stream.set_read_timeout(None);
+                            let auth_ok =
+                                read_auth_line(&mut stream, expected_auth.as_bytes(), deadline)
+                                    .map_err(|e| {
+                                        KernelError::Io(format!(
+                                            "read R driver authentication: {e}"
+                                        ))
+                                    })?;
                             if auth_ok {
+                                stream.set_nonblocking(false).map_err(|e| {
+                                    KernelError::Io(format!("set blocking on R socket: {e}"))
+                                })?;
                                 break stream;
                             }
                         }
@@ -664,18 +729,28 @@ impl Session {
                         "child process was dropped unexpectedly".to_string(),
                     )
                 })?;
-                (child, Some(SessionInput::Socket(stream)))
+                let protocol_socket = stream
+                    .try_clone()
+                    .map_err(|e| KernelError::Io(format!("clone R protocol socket: {e}")))?;
+                (
+                    child,
+                    Some(SessionInput::Socket(stream)),
+                    Some(protocol_socket),
+                    Some(stdout_path),
+                )
             }
         };
 
         let pgid = Mutex::new(Some(child.id()));
-        let stdout: ChildStdout = child.stdout.take().ok_or_else(|| {
-            KernelError::SessionProtocol("interpreter stdout pipe was not created".to_string())
-        })?;
-
         let (sender, lines) = mpsc::sync_channel(256);
+        let protocol_reader: Box<dyn Read + Send> = match protocol_socket {
+            Some(stream) => Box::new(stream),
+            None => Box::new(child.stdout.take().ok_or_else(|| {
+                KernelError::SessionProtocol("interpreter stdout pipe was not created".to_string())
+            })?),
+        };
         std::thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
+            let mut reader = BufReader::new(protocol_reader);
             loop {
                 let mut line = String::new();
                 let mut take = (&mut reader).take(65_536);
@@ -700,6 +775,7 @@ impl Session {
             pgid,
             input,
             lines,
+            stdout_capture,
             temp_dir: temp_dir.to_path_buf(),
             last_used: Instant::now(),
             seq: 0,
@@ -797,6 +873,10 @@ impl Session {
             Ok(()) => {}
             Err(WaitOutcome::TimedOut) => {
                 let duration_ms = millis(started.elapsed());
+                if let Err(error) = self.capture_r_stdout(&files) {
+                    files.cleanup();
+                    return Err(error);
+                }
                 let (stdout, stdout_trunc) = read_text(&files.out, MAX_STREAM_BYTES);
                 let (stderr, stderr_trunc) = read_text(&files.err, MAX_STREAM_BYTES);
                 let result = ExecutionResult {
@@ -830,6 +910,10 @@ impl Session {
 
         match outcome {
             WaitOutcome::Finished => {
+                if let Err(error) = self.capture_r_stdout(&files) {
+                    files.cleanup();
+                    return Err(error);
+                }
                 let mut result = files.read_result(request, duration_ms);
                 if append_bounded_text(&mut result.stdout, &extra_stdout, MAX_STREAM_BYTES) {
                     result.output_truncated = true;
@@ -843,6 +927,10 @@ impl Session {
             }
             WaitOutcome::TimedOut => {
                 self.kill();
+                if let Err(error) = self.capture_r_stdout(&files) {
+                    files.cleanup();
+                    return Err(error);
+                }
                 let (mut stdout, stdout_trunc) = read_text(&files.out, MAX_STREAM_BYTES);
                 let (stderr, stderr_trunc) = read_text(&files.err, MAX_STREAM_BYTES);
                 let mut truncated = stdout_trunc || stderr_trunc || extra_truncated;
@@ -876,6 +964,27 @@ impl Session {
         }
     }
 
+    fn capture_r_stdout(&self, files: &ChunkFiles) -> Result<(), KernelError> {
+        let Some(path) = self.stdout_capture.as_ref() else {
+            return Ok(());
+        };
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| KernelError::Io(format!("open {}: {e}", path.display())))?;
+        let mut output = Vec::new();
+        Read::by_ref(&mut file)
+            .take(MAX_STREAM_BYTES as u64 + 1)
+            .read_to_end(&mut output)
+            .map_err(|e| KernelError::Io(format!("read {}: {e}", path.display())))?;
+        file.set_len(0)
+            .map_err(|e| KernelError::Io(format!("truncate {}: {e}", path.display())))?;
+        fs::write(&files.out, output)
+            .map_err(|e| KernelError::Io(format!("write {}: {e}", files.out.display())))?;
+        Ok(())
+    }
+
     fn wait_for_end(&mut self, seq: u64, deadline: Instant) -> (WaitOutcome, String, bool) {
         let expected = format!("END {seq}");
         let mut extra_stdout = String::new();
@@ -898,7 +1007,9 @@ impl Session {
                 }
                 Ok(None) => return (WaitOutcome::Terminated, extra_stdout, extra_truncated),
                 Err(RecvTimeoutError::Timeout) => {
-                    return (WaitOutcome::TimedOut, extra_stdout, extra_truncated);
+                    if Instant::now() >= deadline {
+                        return (WaitOutcome::TimedOut, extra_stdout, extra_truncated);
+                    }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     return (WaitOutcome::Terminated, extra_stdout, extra_truncated);
@@ -1149,6 +1260,7 @@ fn read_text(path: &Path, limit: usize) -> (String, bool) {
         buffer.truncate(limit);
     }
     let s = String::from_utf8_lossy(&buffer);
+    let truncated = truncated || s.len() > limit;
     let valid_slice = truncate_to_char_boundary(&s, limit);
     (valid_slice.to_string(), truncated)
 }
@@ -1357,7 +1469,32 @@ def snapshot_figures():
             pass
     return snaps
 
-def capture_plots(seq, fmt, before_snaps):
+def track_figure_draws():
+    drawn = set()
+    restorers = []
+    for fig in get_all_figures():
+        try:
+            canvas = fig.canvas
+            original_draw = canvas.draw
+            def tracked_draw(*args, _draw=original_draw, _fig=fig, **kwargs):
+                if bool(getattr(_fig, "stale", False)):
+                    drawn.add(id(_fig))
+                return _draw(*args, **kwargs)
+            canvas.draw = tracked_draw
+            restorers.append((canvas, original_draw, tracked_draw))
+        except Exception:
+            pass
+    return drawn, restorers
+
+def restore_figure_draws(restorers):
+    for canvas, original_draw, tracked_draw in restorers:
+        try:
+            if canvas.draw is tracked_draw:
+                canvas.draw = original_draw
+        except Exception:
+            pass
+
+def capture_plots(seq, fmt, before_snaps, drawn_figures):
     if plt is None:
         return
     try:
@@ -1370,6 +1507,9 @@ def capture_plots(seq, fmt, before_snaps):
                 continue
             before = before_snaps.get(num)
             if before is None or before[0] != id(fig):
+                active_fig = fig
+                break
+            if id(fig) in drawn_figures:
                 active_fig = fig
                 break
             after = after_snaps.get(num)
@@ -1446,6 +1586,7 @@ def main():
 
         status = "ok"
         before_figures = snapshot_figures()
+        drawn_figures, draw_restorers = track_figure_draws()
 
         try:
             if cwd:
@@ -1464,6 +1605,9 @@ def main():
             except Exception:
                 pass
         finally:
+            restore_figure_draws(draw_restorers)
+            if capture:
+                capture_plots(seq, fmt, before_figures, drawn_figures)
             try:
                 out_file.flush()
             except Exception:
@@ -1488,9 +1632,7 @@ def main():
             sys.stdout = STABLE_STDOUT
             sys.stderr = STABLE_STDERR
 
-        if capture:
-            capture_plots(seq, fmt, before_figures)
-        else:
+        if not capture:
             for fig in get_all_figures():
                 try:
                     fig.stale = False
@@ -1632,7 +1774,7 @@ base::environment(.wc_driver$protect_con) <- .wc_driver
 
     code_raw <- base::readBin(con, what = "raw", n = code_len)
 
-    out_path <- base::file.path(.wc_driver$base, base::paste0("out-", seq, ".txt"))
+    out_path <- base::file.path(.wc_driver$base, "driver-stdout.txt")
     err_path <- base::file.path(.wc_driver$base, base::paste0("err-", seq, ".txt"))
     status_path <- base::file.path(.wc_driver$base, base::paste0("status-", seq, ".txt"))
     png_path <- base::file.path(.wc_driver$base, base::paste0("plot-", seq, ".png"))
@@ -1698,7 +1840,7 @@ base::environment(.wc_driver$protect_con) <- .wc_driver
       }, error = function(e) FALSE)
     }
 
-    out_con <- base::file(out_path, open = "wt", encoding = "UTF-8")
+    out_con <- base::file(out_path, open = "at", encoding = "UTF-8")
     err_con <- base::file(err_path, open = "wt", encoding = "UTF-8")
     base::sink(out_con)
     base::sink(err_con, type = "message")
@@ -1708,10 +1850,11 @@ base::environment(.wc_driver$protect_con) <- .wc_driver
         for (i in base::seq_along(parsed)) {
           val <- base::withVisible(base::eval(parsed[[i]], envir = .GlobalEnv))
           if (base::isTRUE(val$visible)) {
-            base::eval(
-              base::as.call(base::list(base::as.name("print"), base::call("quote", val$value))),
-              envir = .GlobalEnv
-            )
+            base_print <- base::call("::", base::quote(base), base::quote(print))
+            base_quote <- base::call("::", base::quote(base), base::quote(quote))
+            quoted_value <- base::as.call(base::list(base_quote, val$value))
+            print_call <- base::as.call(base::list(base_print, quoted_value))
+            base::eval(print_call, envir = .GlobalEnv)
           }
         }
         NULL
@@ -1766,11 +1909,45 @@ base::environment(.wc_driver$protect_con) <- .wc_driver
     }
 
     base::writeLines(status, status_path, useBytes = TRUE)
-    base::cat("\nEND ", seq, "\n", sep = "")
     base::flush(base::stdout())
+    base::writeLines(base::paste0("END ", seq), con, useBytes = TRUE)
+    base::flush(con)
   }
 }
 
 base::environment(.wc_driver$run) <- .wc_driver
 .wc_driver$run()
 "##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authentication_read_obeys_the_startup_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).expect("connect client");
+            for byte in b"AUTH token\n" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let (mut stream, _) = listener.accept().expect("accept client");
+        let started = Instant::now();
+        let authenticated = read_auth_line(
+            &mut stream,
+            b"AUTH token",
+            started + Duration::from_millis(50),
+        )
+        .expect("read auth line");
+        drop(stream);
+        client.join().expect("join client");
+
+        assert!(!authenticated);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+}
