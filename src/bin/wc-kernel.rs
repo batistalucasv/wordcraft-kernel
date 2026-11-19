@@ -71,6 +71,25 @@ struct CliArgs {
     working_dir: Option<PathBuf>,
 }
 
+fn plot_format_name(format: PlotFormat) -> &'static str {
+    match format {
+        PlotFormat::Png => "png",
+        PlotFormat::Svg => "svg",
+        PlotFormat::Both => "both",
+    }
+}
+
+fn plot_format_for_extension(path: &Path) -> Option<PlotFormat> {
+    let extension = path.extension()?.to_str()?;
+    if extension.eq_ignore_ascii_case("png") {
+        Some(PlotFormat::Png)
+    } else if extension.eq_ignore_ascii_case("svg") {
+        Some(PlotFormat::Svg)
+    } else {
+        None
+    }
+}
+
 fn parse_plot_format(val: &str) -> Result<PlotFormat, CliError> {
     match val.trim().to_ascii_lowercase().as_str() {
         "png" => Ok(PlotFormat::Png),
@@ -251,6 +270,23 @@ where
         ));
     }
 
+    if let Some(ref path) = cli.out_plot
+        && let Some(extension_format) = plot_format_for_extension(path)
+    {
+        match cli.plot_format {
+            None => cli.plot_format = Some(extension_format),
+            Some(requested) if requested != extension_format && requested != PlotFormat::Both => {
+                return Err(CliError::Usage(format!(
+                    "conflicting --plot-format '{}' for output file '{}'. Use '{}' or 'both'",
+                    plot_format_name(requested),
+                    path.display(),
+                    plot_format_name(extension_format),
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+
     if let Some(ref dir) = cli.working_dir
         && !dir.is_dir()
     {
@@ -329,24 +365,7 @@ fn run() -> Result<ExitCode, CliError> {
         }
     };
 
-    let plot_format = match cli.plot_format {
-        Some(fmt) => fmt,
-        None => {
-            if let Some(ref path) = cli.out_plot {
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if ext.eq_ignore_ascii_case("svg") {
-                        PlotFormat::Svg
-                    } else {
-                        PlotFormat::Png
-                    }
-                } else {
-                    PlotFormat::Png
-                }
-            } else {
-                PlotFormat::Png
-            }
-        }
-    };
+    let plot_format = cli.plot_format.unwrap_or(PlotFormat::Png);
 
     let mut req = ExecutionRequest::new(language, code)
         .with_timeout(cli.timeout_ms)
@@ -365,35 +384,34 @@ fn run() -> Result<ExitCode, CliError> {
     };
 
     if let Some(ref plot_path) = cli.out_plot {
-        let is_svg_target = plot_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("svg"))
-            .unwrap_or(false);
+        let target_format = plot_format_for_extension(plot_path).unwrap_or(match plot_format {
+            PlotFormat::Svg => PlotFormat::Svg,
+            PlotFormat::Png | PlotFormat::Both => PlotFormat::Png,
+        });
 
-        let written = if is_svg_target {
-            if let Some(ref svg_str) = result.plot_svg {
-                write_file_with_parent_dir(plot_path, svg_str.as_bytes())?;
-                true
-            } else if let Some(ref bytes) = result.plot_png {
-                write_file_with_parent_dir(plot_path, bytes)?;
-                true
-            } else {
-                false
+        let written = match target_format {
+            PlotFormat::Svg => {
+                if let Some(ref svg_str) = result.plot_svg {
+                    write_file_with_parent_dir(plot_path, svg_str.as_bytes())?;
+                    true
+                } else {
+                    false
+                }
             }
-        } else if let Some(ref bytes) = result.plot_png {
-            write_file_with_parent_dir(plot_path, bytes)?;
-            true
-        } else if let Some(ref svg_str) = result.plot_svg {
-            write_file_with_parent_dir(plot_path, svg_str.as_bytes())?;
-            true
-        } else {
-            false
+            PlotFormat::Png | PlotFormat::Both => {
+                if let Some(ref bytes) = result.plot_png {
+                    write_file_with_parent_dir(plot_path, bytes)?;
+                    true
+                } else {
+                    false
+                }
+            }
         };
 
         if !written && cli.capture_plots {
             eprintln!(
-                "wc-kernel: warning: script did not produce any plot; '{}' was not written",
+                "wc-kernel: warning: script did not produce a {} plot; '{}' was not written",
+                plot_format_name(target_format),
                 plot_path.display()
             );
         }

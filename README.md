@@ -15,6 +15,7 @@ Developed specifically for research in **Ecology**, statistical data science, an
   - **R:** Base graphics (`plot()`, `hist()`, `boxplot()`) and modern packages (`ggplot2`).
   - **Python:** `matplotlib`, `seaborn`, etc.
   - Configurable via `PlotFormat::Png`, `PlotFormat::Svg`, and `PlotFormat::Both`.
+  - `with_prefer_svg(true)` upgrades the default PNG capture to SVG; an explicit `PlotFormat::Both` is preserved.
 - **Clean Output Streams:** Strict separation of standard output (`stdout`), standard error (`stderr`), exit codes, and elapsed execution time.
 - **Standalone CLI (`wc-kernel`):** Command-line binary for direct terminal execution, inspection, piped scripts, and JSON integration with external tools.
 
@@ -24,11 +25,15 @@ Developed specifically for research in **Ecology**, statistical data science, an
 
 The crate provides a standalone CLI binary, `wc-kernel`, for terminal execution and automation.
 
-### Installation / Build
+### Installation
+
+Install the binary into your Cargo bin directory so the `wc-kernel` commands below work as written:
 
 ```bash
-cargo build --release --bin wc-kernel
+cargo install --path . --bin wc-kernel
 ```
+
+To build without installing, use `cargo build --release --bin wc-kernel` and run `./target/release/wc-kernel` instead.
 
 ### CLI Usage
 
@@ -101,7 +106,7 @@ wc-kernel --lang r -e 'plot(1:10, 1:10, main="Vector")' --out-plot figure.svg
 
 ---
 
-## Using as a Rust Library
+## Getting Started
 
 ### Adding as a Dependency
 
@@ -162,7 +167,7 @@ fn main() {
 
 ## Testing
 
-Run unit and integration tests:
+Run automated tests:
 
 ```bash
 cargo test

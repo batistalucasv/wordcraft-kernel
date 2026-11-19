@@ -6,12 +6,9 @@ on:
   pull_request:
     branches: [main]
 
- feat/issue-3-standalone-cli
-
 permissions:
   contents: read
 
- main
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -24,11 +21,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
- feat/issue-3-standalone-cli
-
         with:
           persist-credentials: false
- main
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

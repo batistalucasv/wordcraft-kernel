@@ -1,9 +1,32 @@
 use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 fn binary_path() -> &'static str {
     env!("CARGO_BIN_EXE_wc-kernel")
+}
+
+struct TestDir {
+    path: PathBuf,
+}
+
+impl TestDir {
+    fn new(prefix: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
+        fs::create_dir_all(&path).expect("create temp dir");
+        Self { path }
+    }
+
+    fn join(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 #[test]
@@ -157,8 +180,7 @@ fn cli_file_execution_and_inference() {
         return;
     }
 
-    let temp_dir = std::env::temp_dir().join(format!("wc-test-{}", std::process::id()));
-    fs::create_dir_all(&temp_dir).expect("create temp dir");
+    let temp_dir = TestDir::new("wc-test");
     let script_file = temp_dir.join("test_script.py");
     fs::write(&script_file, "print('inferred python works')").expect("write test script");
 
@@ -171,9 +193,6 @@ fn cli_file_execution_and_inference() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout.trim(), "inferred python works");
-
-    let _ = fs::remove_file(script_file);
-    let _ = fs::remove_dir(temp_dir);
 }
 
 #[test]
@@ -183,8 +202,7 @@ fn cli_out_plot_png_saved() {
         return;
     }
 
-    let temp_dir = std::env::temp_dir().join(format!("wc-plot-test-{}", std::process::id()));
-    fs::create_dir_all(&temp_dir).expect("create temp dir");
+    let temp_dir = TestDir::new("wc-plot-test");
     let plot_file = temp_dir.join("generated_plot.png");
 
     let output = Command::new(binary_path())
@@ -206,9 +224,6 @@ fn cli_out_plot_png_saved() {
         bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
         "file must be a valid PNG"
     );
-
-    let _ = fs::remove_file(plot_file);
-    let _ = fs::remove_dir(temp_dir);
 }
 
 #[test]
@@ -218,8 +233,7 @@ fn cli_out_plot_svg_saved() {
         return;
     }
 
-    let temp_dir = std::env::temp_dir().join(format!("wc-svg-test-{}", std::process::id()));
-    fs::create_dir_all(&temp_dir).expect("create temp dir");
+    let temp_dir = TestDir::new("wc-svg-test");
     let plot_file = temp_dir.join("generated_plot.svg");
 
     let output = Command::new(binary_path())
@@ -244,9 +258,79 @@ fn cli_out_plot_svg_saved() {
         content.contains("<svg") && content.contains("</svg>"),
         "file must be a valid SVG"
     );
+}
 
-    let _ = fs::remove_file(plot_file);
-    let _ = fs::remove_dir(temp_dir);
+#[test]
+fn cli_rejects_conflicting_plot_format_and_extension() {
+    let temp_dir = TestDir::new("wc-format-conflict");
+    let plot_file = temp_dir.join("figure.svg");
+
+    let output = Command::new(binary_path())
+        .args([
+            "--lang",
+            "py",
+            "-e",
+            "print(1)",
+            "--plot-format",
+            "png",
+            "--out-plot",
+            plot_file.to_str().expect("valid path"),
+        ])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("conflicting --plot-format"));
+    assert!(!plot_file.exists(), "conflicting export must not write");
+}
+
+#[test]
+fn cli_out_plot_svg_does_not_fall_back_to_png() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+        eprintln!("Skipping Python test: python3 not found");
+        return;
+    }
+
+    let temp_dir = TestDir::new("wc-svg-no-fallback");
+    let plot_file = temp_dir.join("figure.svg");
+
+    let output = Command::new(binary_path())
+        .args([
+            "--lang",
+            "py",
+            "-e",
+            "print('no plot here')",
+            "--out-plot",
+            plot_file.to_str().expect("valid path"),
+        ])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert!(output.status.success());
+    assert!(
+        !plot_file.exists(),
+        "SVG target must not receive PNG bytes when no SVG was captured"
+    );
+}
+
+#[test]
+fn cli_large_stdout_does_not_deadlock() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+        eprintln!("Skipping Python test: python3 not found");
+        return;
+    }
+
+    let output = Command::new(binary_path())
+        .args(["--lang", "py", "-e", "print('x' * 1_000_000)"])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    assert!(output.status.success());
+    assert!(
+        output.stdout.len() >= 1_000_000,
+        "large stdout must be drained without truncation"
+    );
 }
 
 #[test]
