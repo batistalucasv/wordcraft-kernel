@@ -7,6 +7,15 @@ fn binary_path() -> &'static str {
     env!("CARGO_BIN_EXE_wc-kernel")
 }
 
+fn supervisor_binary_path() -> &'static str {
+    env!("CARGO_BIN_EXE_wc-kernel-supervisor")
+}
+
+#[test]
+fn supervisor_helper_is_built_with_the_cli() {
+    assert!(PathBuf::from(supervisor_binary_path()).is_file());
+}
+
 struct TestDir {
     path: PathBuf,
 }
@@ -400,6 +409,34 @@ fn cli_file_execution_resolves_sibling_imports() {
         ])
         .output()
         .expect("failed to execute wc-kernel");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_accepts_non_utf8_file_paths() {
+    use std::os::unix::ffi::OsStringExt;
+
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+        return;
+    }
+
+    let temp_dir = TestDir::new("wc-non-utf8-file");
+    let script_dir = temp_dir
+        .path
+        .join(std::ffi::OsString::from_vec(b"dir-\xff".to_vec()));
+    fs::create_dir(&script_dir).expect("create non-UTF-8 directory");
+    fs::write(script_dir.join("helper.py"), "VALUE = 42\n").expect("write helper module");
+    let script = script_dir.join("script.py");
+    fs::write(&script, "import helper\nprint(helper.VALUE)\n").expect("write script");
+
+    let output = Command::new(binary_path())
+        .args(["--no-plot", "--file"])
+        .arg(&script)
+        .output()
+        .expect("run CLI");
 
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");

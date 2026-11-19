@@ -11,6 +11,7 @@
     clippy::unreachable
 )]
 
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -102,10 +103,74 @@ fn parse_plot_format(val: &str) -> Result<PlotFormat, CliError> {
     }
 }
 
-fn parse_args<I>(mut args: I) -> Result<Option<CliArgs>, CliError>
+fn next_text_arg(
+    args: &mut impl Iterator<Item = OsString>,
+    option: &str,
+    expected: &str,
+) -> Result<String, CliError> {
+    let value = args.next().ok_or_else(|| {
+        CliError::Usage(format!("option '{option}' requires an argument {expected}"))
+    })?;
+    value
+        .into_string()
+        .map_err(|_| CliError::Usage(format!("argument for '{option}' must be valid UTF-8")))
+}
+
+fn next_path_arg(
+    args: &mut impl Iterator<Item = OsString>,
+    option: &str,
+    expected: &str,
+) -> Result<PathBuf, CliError> {
+    args.next().map(PathBuf::from).ok_or_else(|| {
+        CliError::Usage(format!("option '{option}' requires an argument {expected}"))
+    })
+}
+
+#[cfg(unix)]
+fn strip_os_prefix(value: &OsStr, prefix: &str) -> Option<OsString> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    value
+        .as_bytes()
+        .strip_prefix(prefix.as_bytes())
+        .map(|suffix| OsString::from_vec(suffix.to_vec()))
+}
+
+#[cfg(windows)]
+fn strip_os_prefix(value: &OsStr, prefix: &str) -> Option<OsString> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let value = value.encode_wide().collect::<Vec<_>>();
+    let prefix = prefix.encode_utf16().collect::<Vec<_>>();
+    value
+        .strip_prefix(prefix.as_slice())
+        .map(OsString::from_wide)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn strip_os_prefix(value: &OsStr, prefix: &str) -> Option<OsString> {
+    value
+        .to_str()
+        .and_then(|value| value.strip_prefix(prefix))
+        .map(OsString::from)
+}
+
+fn set_file_path(cli: &mut CliArgs, path: PathBuf) -> Result<(), CliError> {
+    if cli.file_path.is_some() {
+        return Err(CliError::Usage(
+            "multiple --file options are not allowed".to_string(),
+        ));
+    }
+    cli.file_path = Some(path);
+    Ok(())
+}
+
+fn parse_args<I, S>(args: I) -> Result<Option<CliArgs>, CliError>
 where
-    I: Iterator<Item = String>,
+    I: Iterator<Item = S>,
+    S: Into<OsString>,
 {
+    let mut args = args.map(Into::into);
     let mut cli = CliArgs {
         timeout_ms: 30_000,
         capture_plots: true,
@@ -113,6 +178,34 @@ where
     };
 
     while let Some(arg) = args.next() {
+        let Some(arg) = arg.to_str() else {
+            let path_option = [
+                ("--file=", 0_u8),
+                ("-f=", 0),
+                ("--out-plot=", 1),
+                ("--working-dir=", 2),
+                ("--cwd=", 2),
+                ("-C=", 2),
+            ]
+            .into_iter()
+            .find_map(|(prefix, kind)| strip_os_prefix(&arg, prefix).map(|path| (kind, path)));
+            if let Some((kind, path)) = path_option {
+                match kind {
+                    0 => set_file_path(&mut cli, PathBuf::from(path))?,
+                    1 => cli.out_plot = Some(PathBuf::from(path)),
+                    _ => cli.working_dir = Some(PathBuf::from(path)),
+                }
+                continue;
+            }
+            if arg.to_string_lossy().starts_with('-') {
+                return Err(CliError::Usage(format!(
+                    "unrecognized option '{}'",
+                    arg.to_string_lossy()
+                )));
+            }
+            set_file_path(&mut cli, PathBuf::from(arg))?;
+            continue;
+        };
         if arg == "-h" || arg == "--help" {
             print!("{USAGE}");
             return Ok(None);
@@ -126,9 +219,7 @@ where
         } else if arg == "--stdin" {
             cli.read_stdin = true;
         } else if arg == "-l" || arg == "--lang" {
-            let val = args.next().ok_or_else(|| {
-                CliError::Usage(format!("option '{arg}' requires an argument <r|py>"))
-            })?;
+            let val = next_text_arg(&mut args, arg, "<r|py>")?;
             let lang = CodeLanguage::from_str(&val).map_err(|_| {
                 CliError::Usage(format!(
                     "unsupported language '{val}'. Expected 'r' or 'py'/'python'"
@@ -150,42 +241,20 @@ where
             })?;
             cli.language = Some(lang);
         } else if arg == "-e" || arg == "--eval" {
-            let val = args.next().ok_or_else(|| {
-                CliError::Usage(format!("option '{arg}' requires an argument <code>"))
-            })?;
+            let val = next_text_arg(&mut args, arg, "<code>")?;
             cli.eval_snippets.push(val);
         } else if let Some(val) = arg.strip_prefix("--eval=") {
             cli.eval_snippets.push(val.to_string());
         } else if let Some(val) = arg.strip_prefix("-e=") {
             cli.eval_snippets.push(val.to_string());
         } else if arg == "-f" || arg == "--file" {
-            let val = args.next().ok_or_else(|| {
-                CliError::Usage(format!("option '{arg}' requires an argument <path>"))
-            })?;
-            if cli.file_path.is_some() {
-                return Err(CliError::Usage(
-                    "multiple --file options are not allowed".to_string(),
-                ));
-            }
-            cli.file_path = Some(PathBuf::from(val));
+            set_file_path(&mut cli, next_path_arg(&mut args, arg, "<path>")?)?;
         } else if let Some(val) = arg.strip_prefix("--file=") {
-            if cli.file_path.is_some() {
-                return Err(CliError::Usage(
-                    "multiple --file options are not allowed".to_string(),
-                ));
-            }
-            cli.file_path = Some(PathBuf::from(val));
+            set_file_path(&mut cli, PathBuf::from(val))?;
         } else if let Some(val) = arg.strip_prefix("-f=") {
-            if cli.file_path.is_some() {
-                return Err(CliError::Usage(
-                    "multiple --file options are not allowed".to_string(),
-                ));
-            }
-            cli.file_path = Some(PathBuf::from(val));
+            set_file_path(&mut cli, PathBuf::from(val))?;
         } else if arg == "-t" || arg == "--timeout" {
-            let val = args.next().ok_or_else(|| {
-                CliError::Usage(format!("option '{arg}' requires an argument <ms>"))
-            })?;
+            let val = next_text_arg(&mut args, arg, "<ms>")?;
             let ms: u64 = val.parse().map_err(|_| {
                 CliError::Usage(format!(
                     "invalid timeout '{val}'. Expected a positive integer in milliseconds"
@@ -222,26 +291,16 @@ where
             }
             cli.timeout_ms = ms;
         } else if arg == "--out-plot" {
-            let val = args.next().ok_or_else(|| {
-                CliError::Usage("option '--out-plot' requires an argument <path>".to_string())
-            })?;
-            cli.out_plot = Some(PathBuf::from(val));
+            cli.out_plot = Some(next_path_arg(&mut args, arg, "<path>")?);
         } else if let Some(val) = arg.strip_prefix("--out-plot=") {
             cli.out_plot = Some(PathBuf::from(val));
         } else if arg == "--plot-format" {
-            let val = args.next().ok_or_else(|| {
-                CliError::Usage(
-                    "option '--plot-format' requires an argument <png|svg|both>".to_string(),
-                )
-            })?;
+            let val = next_text_arg(&mut args, arg, "<png|svg|both>")?;
             cli.plot_format = Some(parse_plot_format(&val)?);
         } else if let Some(val) = arg.strip_prefix("--plot-format=") {
             cli.plot_format = Some(parse_plot_format(val)?);
         } else if arg == "-C" || arg == "--cwd" || arg == "--working-dir" {
-            let val = args.next().ok_or_else(|| {
-                CliError::Usage(format!("option '{arg}' requires an argument <dir>"))
-            })?;
-            cli.working_dir = Some(PathBuf::from(val));
+            cli.working_dir = Some(next_path_arg(&mut args, arg, "<dir>")?);
         } else if let Some(val) = arg.strip_prefix("--cwd=") {
             cli.working_dir = Some(PathBuf::from(val));
         } else if let Some(val) = arg.strip_prefix("--working-dir=") {
@@ -310,7 +369,7 @@ fn infer_language_from_path(path: &Path) -> Option<CodeLanguage> {
 }
 
 fn run() -> Result<ExitCode, CliError> {
-    let args = std::env::args().skip(1);
+    let args = std::env::args_os().skip(1);
     let maybe_cli = parse_args(args)?;
     let cli = match maybe_cli {
         Some(c) => c,
@@ -522,37 +581,54 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    fn parse_cli(args: Vec<String>) -> io::Result<Option<CliArgs>> {
+        parse_args(args.into_iter()).map_err(|error| io::Error::other(format!("{error:?}")))
+    }
+
+    fn assert_usage_error(args: Vec<String>) -> io::Result<()> {
+        match parse_args(args.into_iter()) {
+            Err(CliError::Usage(_)) => Ok(()),
+            Err(error) => Err(io::Error::other(format!(
+                "unexpected parser error: {error:?}"
+            ))),
+            Ok(_) => Err(io::Error::other("expected a usage error")),
+        }
+    }
+
     #[test]
-    fn test_parse_help() {
+    fn test_parse_help() -> io::Result<()> {
         let args = vec!["--help".to_string()];
-        let parsed = parse_args(args.into_iter()).unwrap();
+        let parsed = parse_cli(args)?;
         assert!(parsed.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_version() {
+    fn test_parse_version() -> io::Result<()> {
         let args = vec!["-V".to_string()];
-        let parsed = parse_args(args.into_iter()).unwrap();
+        let parsed = parse_cli(args)?;
         assert!(parsed.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_eval_and_lang() {
+    fn test_parse_eval_and_lang() -> io::Result<()> {
         let args = vec![
             "--lang".to_string(),
             "r".to_string(),
             "-e".to_string(),
             "print(1+1)".to_string(),
         ];
-        let parsed = parse_args(args.into_iter()).unwrap().unwrap();
+        let parsed = parse_cli(args)?.ok_or_else(|| io::Error::other("expected CLI arguments"))?;
         assert_eq!(parsed.language, Some(CodeLanguage::R));
         assert_eq!(parsed.eval_snippets, vec!["print(1+1)"]);
         assert_eq!(parsed.timeout_ms, 30_000);
         assert!(!parsed.json);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_json_timeout_and_out_plot() {
+    fn test_parse_json_timeout_and_out_plot() -> io::Result<()> {
         let args = vec![
             "-l".to_string(),
             "py".to_string(),
@@ -566,19 +642,21 @@ mod tests {
             "--plot-format".to_string(),
             "both".to_string(),
         ];
-        let parsed = parse_args(args.into_iter()).unwrap().unwrap();
+        let parsed = parse_cli(args)?.ok_or_else(|| io::Error::other("expected CLI arguments"))?;
         assert_eq!(parsed.language, Some(CodeLanguage::Python));
         assert!(parsed.json);
         assert_eq!(parsed.timeout_ms, 5000);
         assert_eq!(parsed.out_plot, Some(PathBuf::from("out.png")));
         assert_eq!(parsed.plot_format, Some(PlotFormat::Both));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_file_positional() {
+    fn test_parse_file_positional() -> io::Result<()> {
         let args = vec!["script.py".to_string()];
-        let parsed = parse_args(args.into_iter()).unwrap().unwrap();
+        let parsed = parse_cli(args)?.ok_or_else(|| io::Error::other("expected CLI arguments"))?;
         assert_eq!(parsed.file_path, Some(PathBuf::from("script.py")));
+        Ok(())
     }
 
     #[test]
@@ -599,21 +677,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_invalid_args() {
-        let args = vec!["--unrecognized".to_string()];
-        let err = parse_args(args.into_iter()).unwrap_err();
-        assert!(matches!(err, CliError::Usage(_)));
-
-        let args = vec!["--timeout".to_string(), "0".to_string()];
-        let err = parse_args(args.into_iter()).unwrap_err();
-        assert!(matches!(err, CliError::Usage(_)));
-
-        let args = vec!["--lang".to_string(), "rust".to_string()];
-        let err = parse_args(args.into_iter()).unwrap_err();
-        assert!(matches!(err, CliError::Usage(_)));
-
-        let args = vec!["--plot-format".to_string(), "invalid".to_string()];
-        let err = parse_args(args.into_iter()).unwrap_err();
-        assert!(matches!(err, CliError::Usage(_)));
+    fn test_parse_invalid_args() -> io::Result<()> {
+        assert_usage_error(vec!["--unrecognized".to_string()])?;
+        assert_usage_error(vec!["--timeout".to_string(), "0".to_string()])?;
+        assert_usage_error(vec!["--lang".to_string(), "rust".to_string()])?;
+        assert_usage_error(vec!["--plot-format".to_string(), "invalid".to_string()])?;
+        Ok(())
     }
 }

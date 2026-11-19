@@ -30,10 +30,10 @@ The crate provides a standalone CLI binary, `wc-kernel`, for terminal execution 
 Install the binary into your Cargo bin directory so the `wc-kernel` commands below work as written:
 
 ```bash
-cargo install --path . --bin wc-kernel
+cargo install --path .
 ```
 
-To build without installing, use `cargo build --release --bin wc-kernel` and run `./target/release/wc-kernel` instead.
+This installs both `wc-kernel` and its `wc-kernel-supervisor` helper. To build without installing, use `cargo build --release --bins` and run `./target/release/wc-kernel` instead.
 
 ### CLI Usage
 
@@ -63,7 +63,7 @@ OPTIONS:
 
 Scripts run in the directory where you invoked `wc-kernel` unless `-C` is given, so relative reads and writes resolve there. When running a Python file with `--file`, its directory is also added to the module search path, so sibling imports keep working.
 
-Captured output is capped at 10 MiB per stream. A script that exceeds the cap is stopped, the captured text is truncated, and `output_truncated` is set to `true` in the JSON result.
+Captured output is capped at 10 MiB per stream. Bytes beyond the cap are discarded and `output_truncated` is set to `true`; if the script is still running when the supervisor detects the overrun, it is stopped. A script that finishes first may still return `success: true` with truncated output.
 
 ### CLI Examples
 
@@ -85,6 +85,7 @@ Output:
   "exit_code": 0,
   "success": true,
   "timed_out": false,
+  "output_truncated": false,
   "plot_png": null,
   "plot_svg": null,
   "duration_ms": 42
@@ -121,6 +122,8 @@ In your `Cargo.toml`:
 [dependencies]
 wordcraft-kernel = { git = "https://github.com/batistalucasv/wordcraft-kernel" }
 ```
+
+The `wc-kernel-supervisor` executable must be available beside the host executable or on `PATH`. If it is stored elsewhere, set it per request with `ExecutionRequest::with_supervisor_path`. Linux uses a child subreaper and Windows uses a Job Object to stop descendants that leave the interpreter's process group. Other Unix systems retain process-group cleanup but cannot guarantee cleanup of descendants that create a new session.
 
 ### Rust Example
 
