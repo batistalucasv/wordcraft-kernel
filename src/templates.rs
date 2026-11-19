@@ -141,10 +141,7 @@ impl Template {
     pub fn render(&self, overrides: &[(&str, &str)]) -> Result<String, KernelError> {
         for (key, _) in overrides {
             if self.param(key).is_none() {
-                return Err(KernelError::UnknownTemplateParameter {
-                    template: self.id.to_string(),
-                    parameter: (*key).to_string(),
-                });
+                return Err(KernelError::UnknownTemplateParameter { template: self.id.to_string(), parameter: (*key).to_string() });
             }
         }
 
@@ -158,9 +155,7 @@ impl Template {
             rendered.push_str(&rest[..start]);
             let after = &rest[start + 2..];
             let Some(end) = after.find("}}") else {
-                return Err(KernelError::UnterminatedPlaceholder {
-                    template: self.id.to_string(),
-                });
+                return Err(KernelError::UnterminatedPlaceholder { template: self.id.to_string() });
             };
             let key = after[..end].trim();
             let value = overrides
@@ -168,10 +163,7 @@ impl Template {
                 .find(|(candidate, _)| *candidate == key)
                 .map(|(_, value)| *value)
                 .or_else(|| self.param(key).map(|param| param.default))
-                .ok_or_else(|| KernelError::UndefinedPlaceholder {
-                    template: self.id.to_string(),
-                    placeholder: key.to_string(),
-                })?;
+                .ok_or_else(|| KernelError::UndefinedPlaceholder { template: self.id.to_string(), placeholder: key.to_string() })?;
             rendered.push_str(value);
             rest = &after[end + 2..];
         }
@@ -195,23 +187,17 @@ pub fn all() -> &'static [Template] {
 
 /// Find a template by id, ignoring ASCII case.
 pub fn find(id: &str) -> Option<&'static Template> {
-    all()
-        .iter()
-        .find(|template| template.id.eq_ignore_ascii_case(id))
+    all().iter().find(|template| template.id.eq_ignore_ascii_case(id))
 }
 
 /// Iterate over the templates written in one language.
 pub fn by_language(language: CodeLanguage) -> impl Iterator<Item = &'static Template> {
-    all()
-        .iter()
-        .filter(move |template| template.language == language)
+    all().iter().filter(move |template| template.language == language)
 }
 
 /// Iterate over the templates in one category.
 pub fn by_category(category: TemplateCategory) -> impl Iterator<Item = &'static Template> {
-    all()
-        .iter()
-        .filter(move |template| template.category == category)
+    all().iter().filter(move |template| template.category == category)
 }
 
 /// Every category, for building a filtered browser.
@@ -597,12 +583,7 @@ static TEMPLATES: &[Template] = &[
                 default: "25",
                 description: "Number of sampling units in the synthetic matrix.",
             },
-            TemplateParam {
-                key: "n_species",
-                label: "Species",
-                default: "12",
-                description: "Number of species in the synthetic matrix.",
-            },
+            TemplateParam { key: "n_species", label: "Species", default: "12", description: "Number of species in the synthetic matrix." },
             TemplateParam {
                 key: "permutations",
                 label: "Permutations",
@@ -626,18 +607,8 @@ static TEMPLATES: &[Template] = &[
         category: TemplateCategory::Regression,
         requires: &["ggplot2"],
         params: &[
-            TemplateParam {
-                key: "seed",
-                label: "Random seed",
-                default: "7",
-                description: "Makes the synthetic observations reproducible.",
-            },
-            TemplateParam {
-                key: "n_observations",
-                label: "Observations",
-                default: "40",
-                description: "Number of synthetic observations.",
-            },
+            TemplateParam { key: "seed", label: "Random seed", default: "7", description: "Makes the synthetic observations reproducible." },
+            TemplateParam { key: "n_observations", label: "Observations", default: "40", description: "Number of synthetic observations." },
             TemplateParam {
                 key: "confidence",
                 label: "Confidence level",
@@ -661,24 +632,14 @@ static TEMPLATES: &[Template] = &[
         category: TemplateCategory::HypothesisTesting,
         requires: &["ggplot2"],
         params: &[
-            TemplateParam {
-                key: "seed",
-                label: "Random seed",
-                default: "11",
-                description: "Makes the synthetic measurements reproducible.",
-            },
+            TemplateParam { key: "seed", label: "Random seed", default: "11", description: "Makes the synthetic measurements reproducible." },
             TemplateParam {
                 key: "n_per_group",
                 label: "Samples per habitat",
                 default: "15",
                 description: "Number of synthetic samples in each habitat.",
             },
-            TemplateParam {
-                key: "title",
-                label: "Plot title",
-                default: "Biomass by habitat",
-                description: "Title drawn above the box plots.",
-            },
+            TemplateParam { key: "title", label: "Plot title", default: "Biomass by habitat", description: "Title drawn above the box plots." },
         ],
         code: R_TTEST_ANOVA,
     },
@@ -713,18 +674,8 @@ static TEMPLATES: &[Template] = &[
         category: TemplateCategory::Correlation,
         requires: &["pandas", "seaborn", "matplotlib", "scipy"],
         params: &[
-            TemplateParam {
-                key: "seed",
-                label: "Random seed",
-                default: "2024",
-                description: "Makes the synthetic measurements reproducible.",
-            },
-            TemplateParam {
-                key: "n_samples",
-                label: "Samples",
-                default: "60",
-                description: "Number of synthetic samples.",
-            },
+            TemplateParam { key: "seed", label: "Random seed", default: "2024", description: "Makes the synthetic measurements reproducible." },
+            TemplateParam { key: "n_samples", label: "Samples", default: "60", description: "Number of synthetic samples." },
             TemplateParam {
                 key: "method",
                 label: "Correlation method",
@@ -748,18 +699,8 @@ static TEMPLATES: &[Template] = &[
         category: TemplateCategory::Regression,
         requires: &["numpy", "pandas", "scipy"],
         params: &[
-            TemplateParam {
-                key: "seed",
-                label: "Random seed",
-                default: "7",
-                description: "Makes the synthetic observations reproducible.",
-            },
-            TemplateParam {
-                key: "n_samples",
-                label: "Samples",
-                default: "45",
-                description: "Number of synthetic observations.",
-            },
+            TemplateParam { key: "seed", label: "Random seed", default: "7", description: "Makes the synthetic observations reproducible." },
+            TemplateParam { key: "n_samples", label: "Samples", default: "45", description: "Number of synthetic observations." },
             TemplateParam {
                 key: "confidence",
                 label: "Confidence level",

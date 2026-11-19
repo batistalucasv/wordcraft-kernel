@@ -25,8 +25,7 @@ struct TestDir {
 impl TestDir {
     fn new(prefix: &str) -> Self {
         for attempt in 0..64 {
-            let path =
-                std::env::temp_dir().join(format!("{prefix}-{}-{attempt}", std::process::id()));
+            let path = std::env::temp_dir().join(format!("{prefix}-{}-{attempt}", std::process::id()));
             match fs::create_dir(&path) {
                 Ok(()) => return Self { path },
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -48,15 +47,11 @@ impl Drop for TestDir {
 }
 
 fn python_has_matplotlib() -> bool {
-    let Some(python) = wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python)
-    else {
+    let Some(python) = wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python) else {
         return false;
     };
     let output = Command::new(python)
-        .args([
-            "-c",
-            "import importlib.util, sys; sys.exit(42 if importlib.util.find_spec('matplotlib') is None else 0)",
-        ])
+        .args(["-c", "import importlib.util, sys; sys.exit(42 if importlib.util.find_spec('matplotlib') is None else 0)"])
         .output()
         .expect("probe matplotlib with the configured Python interpreter");
     match output.status.code() {
@@ -68,10 +63,7 @@ fn python_has_matplotlib() -> bool {
 
 #[test]
 fn cli_help_flag() {
-    let output = Command::new(binary_path())
-        .arg("--help")
-        .output()
-        .expect("failed to execute wc-kernel");
+    let output = Command::new(binary_path()).arg("--help").output().expect("failed to execute wc-kernel");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -84,10 +76,7 @@ fn cli_help_flag() {
 
 #[test]
 fn cli_version_flag() {
-    let output = Command::new(binary_path())
-        .arg("--version")
-        .output()
-        .expect("failed to execute wc-kernel");
+    let output = Command::new(binary_path()).arg("--version").output().expect("failed to execute wc-kernel");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -101,10 +90,7 @@ fn cli_acceptance_r_eval_basic() {
         return;
     }
 
-    let output = Command::new(binary_path())
-        .args(["--lang", "r", "-e", "print(1+1)"])
-        .output()
-        .expect("failed to execute wc-kernel");
+    let output = Command::new(binary_path()).args(["--lang", "r", "-e", "print(1+1)"]).output().expect("failed to execute wc-kernel");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -118,10 +104,7 @@ fn cli_acceptance_r_eval_json() {
         return;
     }
 
-    let output = Command::new(binary_path())
-        .args(["--lang", "r", "-e", "print(1+1)", "--json"])
-        .output()
-        .expect("failed to execute wc-kernel");
+    let output = Command::new(binary_path()).args(["--lang", "r", "-e", "print(1+1)", "--json"]).output().expect("failed to execute wc-kernel");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -130,12 +113,7 @@ fn cli_acceptance_r_eval_json() {
     assert_eq!(json["success"], true);
     assert_eq!(json["timed_out"], false);
     assert_eq!(json["exit_code"], 0);
-    assert!(
-        json["stdout"]
-            .as_str()
-            .expect("stdout string")
-            .contains("[1] 2")
-    );
+    assert!(json["stdout"].as_str().expect("stdout string").contains("[1] 2"));
 }
 
 #[test]
@@ -145,10 +123,7 @@ fn cli_python_eval_basic() {
         return;
     }
 
-    let output = Command::new(binary_path())
-        .args(["--lang", "py", "-e", "print(10 + 25)"])
-        .output()
-        .expect("failed to execute wc-kernel");
+    let output = Command::new(binary_path()).args(["--lang", "py", "-e", "print(10 + 25)"]).output().expect("failed to execute wc-kernel");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -162,10 +137,8 @@ fn cli_python_eval_json() {
         return;
     }
 
-    let output = Command::new(binary_path())
-        .args(["--lang", "py", "-e", "print('hello json')", "--json"])
-        .output()
-        .expect("failed to execute wc-kernel");
+    let output =
+        Command::new(binary_path()).args(["--lang", "py", "-e", "print('hello json')", "--json"]).output().expect("failed to execute wc-kernel");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -174,32 +147,19 @@ fn cli_python_eval_json() {
     assert_eq!(json["success"], true);
     assert_eq!(json["timed_out"], false);
     assert_eq!(json["exit_code"], 0);
-    assert!(
-        json["stdout"]
-            .as_str()
-            .expect("stdout string")
-            .contains("hello json")
-    );
+    assert!(json["stdout"].as_str().expect("stdout string").contains("hello json"));
 }
 
 #[cfg(unix)]
 fn assert_process_stopped(pid: &str) {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        let running = Command::new("kill")
-            .args(["-0", pid])
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
+        let running = Command::new("kill").args(["-0", pid]).stderr(Stdio::null()).status().map(|status| status.success()).unwrap_or(false);
         if !running {
             return;
         }
         if Instant::now() >= deadline {
-            let _ = Command::new("kill")
-                .args(["-KILL", pid])
-                .stderr(Stdio::null())
-                .status();
+            let _ = Command::new("kill").args(["-KILL", pid]).stderr(Stdio::null()).status();
             panic!("interpreter {pid} survived cancellation");
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -235,10 +195,7 @@ fn assert_signal_cleans_execution(signal: nix::sys::signal::Signal, prefix: &str
         if let Some(status) = child.try_wait().expect("check wc-kernel status") {
             panic!("wc-kernel exited before starting user code: {status}");
         }
-        assert!(
-            Instant::now() < startup_deadline,
-            "user code did not start before the deadline"
-        );
+        assert!(Instant::now() < startup_deadline, "user code did not start before the deadline");
         std::thread::sleep(Duration::from_millis(10));
     }
     let interpreter_pid = fs::read_to_string(&pid_file).expect("read interpreter pid");
@@ -261,13 +218,7 @@ fn assert_signal_cleans_execution(signal: nix::sys::signal::Signal, prefix: &str
     };
 
     assert_eq!(status.code(), Some(130));
-    assert_eq!(
-        fs::read_dir(&scratch_dir)
-            .expect("read scratch directory")
-            .count(),
-        0,
-        "execution workspace was not cleaned up after {signal:?}"
-    );
+    assert_eq!(fs::read_dir(&scratch_dir).expect("read scratch directory").count(), 0, "execution workspace was not cleaned up after {signal:?}");
     assert_process_stopped(&interpreter_pid);
 }
 
@@ -304,11 +255,7 @@ fn cli_ctrl_c_during_stdin_read_exits_without_running_code() {
     std::thread::sleep(Duration::from_millis(300));
 
     let pid = i32::try_from(child.id()).expect("wc-kernel PID fits in i32");
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGINT,
-    )
-    .expect("send SIGINT to wc-kernel");
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGINT).expect("send SIGINT to wc-kernel");
 
     let exit_deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {
@@ -325,13 +272,7 @@ fn cli_ctrl_c_during_stdin_read_exits_without_running_code() {
     drop(stdin);
 
     assert_eq!(status.code(), Some(130));
-    assert_eq!(
-        fs::read_dir(&scratch_dir)
-            .expect("read scratch directory")
-            .count(),
-        0,
-        "no workspace should be created for cancelled stdin input"
-    );
+    assert_eq!(fs::read_dir(&scratch_dir).expect("read scratch directory").count(), 0, "no workspace should be created for cancelled stdin input");
 }
 
 #[cfg(unix)]
@@ -347,13 +288,7 @@ fn cli_ctrl_c_interrupts_a_blocked_output_write() {
 
     // 4 MiB exceeds the pipe capacity, so the CLI cannot finish writing it.
     let mut child = Command::new(binary_path())
-        .args([
-            "--lang",
-            "py",
-            "-e",
-            "print('x' * (4 * 1024 * 1024))",
-            "--no-plot",
-        ])
+        .args(["--lang", "py", "-e", "print('x' * (4 * 1024 * 1024))", "--no-plot"])
         .env("TMPDIR", &scratch_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -366,19 +301,13 @@ fn cli_ctrl_c_interrupts_a_blocked_output_write() {
     let stdout = child.stdout.take().expect("stdout piped");
     let poll_deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let mut fds = [nix::poll::PollFd::new(
-            stdout.as_fd(),
-            nix::poll::PollFlags::POLLIN,
-        )];
+        let mut fds = [nix::poll::PollFd::new(stdout.as_fd(), nix::poll::PollFlags::POLLIN)];
         match nix::poll::poll(&mut fds, 100u16) {
             Ok(_) => {}
             Err(nix::errno::Errno::EINTR) => continue,
             Err(error) => panic!("poll wc-kernel stdout: {error}"),
         }
-        if fds[0]
-            .revents()
-            .is_some_and(|flags| flags.contains(nix::poll::PollFlags::POLLIN))
-        {
+        if fds[0].revents().is_some_and(|flags| flags.contains(nix::poll::PollFlags::POLLIN)) {
             break;
         }
         if Instant::now() >= poll_deadline {
@@ -390,11 +319,7 @@ fn cli_ctrl_c_interrupts_a_blocked_output_write() {
     }
 
     let pid = i32::try_from(child.id()).expect("wc-kernel PID fits in i32");
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGINT,
-    )
-    .expect("send SIGINT to wc-kernel");
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGINT).expect("send SIGINT to wc-kernel");
 
     let exit_deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {
@@ -412,13 +337,7 @@ fn cli_ctrl_c_interrupts_a_blocked_output_write() {
     drop(stdout);
 
     assert_eq!(status.code(), Some(130));
-    assert_eq!(
-        fs::read_dir(&scratch_dir)
-            .expect("read scratch directory")
-            .count(),
-        0,
-        "execution workspace was not cleaned up after SIGINT"
-    );
+    assert_eq!(fs::read_dir(&scratch_dir).expect("read scratch directory").count(), 0, "execution workspace was not cleaned up after SIGINT");
 }
 
 #[cfg(unix)]
@@ -438,10 +357,7 @@ fn cli_closed_stdout_pipe_does_not_panic() {
 
     let output = child.wait_with_output().expect("wait for wc-kernel");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "a closed output pipe must not fail the run: {stderr}"
-    );
+    assert!(output.status.success(), "a closed output pipe must not fail the run: {stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
 }
 
@@ -453,13 +369,7 @@ fn cli_closed_stdout_pipe_keeps_the_script_exit_status() {
     }
 
     let mut child = Command::new(binary_path())
-        .args([
-            "--lang",
-            "py",
-            "-e",
-            "import sys\nprint('x' * 65536)\nsys.exit(3)",
-            "--no-plot",
-        ])
+        .args(["--lang", "py", "-e", "import sys\nprint('x' * 65536)\nsys.exit(3)", "--no-plot"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -467,18 +377,13 @@ fn cli_closed_stdout_pipe_keeps_the_script_exit_status() {
     drop(child.stdout.take().expect("stdout piped"));
 
     let output = child.wait_with_output().expect("wait for wc-kernel");
-    assert_eq!(
-        output.status.code(),
-        Some(3),
-        "a closed pipe must not replace the script exit status"
-    );
+    assert_eq!(output.status.code(), Some(3), "a closed pipe must not replace the script exit status");
 }
 
 #[cfg(unix)]
 #[test]
 fn cli_resolves_interpreter_before_changing_directory() {
-    let Some(python) = wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python)
-    else {
+    let Some(python) = wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python) else {
         return;
     };
 
@@ -487,36 +392,19 @@ fn cli_resolves_interpreter_before_changing_directory() {
     let working_dir = fixture.join("cwd");
     fs::create_dir(&bin_dir).expect("create bin directory");
     fs::create_dir(&working_dir).expect("create working directory");
-    std::os::unix::fs::symlink(
-        fs::canonicalize(python).expect("canonical python"),
-        bin_dir.join("python3"),
-    )
-    .expect("link python3 into the relative PATH entry");
+    std::os::unix::fs::symlink(fs::canonicalize(python).expect("canonical python"), bin_dir.join("python3"))
+        .expect("link python3 into the relative PATH entry");
 
     let output = Command::new(binary_path())
-        .args([
-            "--lang",
-            "py",
-            "-e",
-            "print('relative path works')",
-            "--no-plot",
-            "--cwd",
-        ])
+        .args(["--lang", "py", "-e", "print('relative path works')", "--no-plot", "--cwd"])
         .arg(&working_dir)
         .current_dir(&fixture.path)
         .env("PATH", "bin")
         .output()
         .expect("execute wc-kernel");
 
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "relative path works"
-    );
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "relative path works");
 }
 
 #[test]
@@ -536,9 +424,7 @@ fn cli_stdin_pipe_execution() {
 
     {
         let stdin = child.stdin.as_mut().expect("stdin piped");
-        stdin
-            .write_all(b"x = 5\ny = 7\nprint(x * y)\n")
-            .expect("write to stdin");
+        stdin.write_all(b"x = 5\ny = 7\nprint(x * y)\n").expect("write to stdin");
     }
 
     let output = child.wait_with_output().expect("wait with output");
@@ -559,10 +445,8 @@ fn cli_file_execution_and_inference() {
     fs::write(&script_file, "print('inferred python works')").expect("write test script");
 
     // Execute without --lang, inferring from .py extension
-    let output = Command::new(binary_path())
-        .args(["--file", script_file.to_str().expect("valid path")])
-        .output()
-        .expect("failed to execute wc-kernel");
+    let output =
+        Command::new(binary_path()).args(["--file", script_file.to_str().expect("valid path")]).output().expect("failed to execute wc-kernel");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -580,24 +464,14 @@ fn cli_out_plot_png_saved() {
     let plot_file = temp_dir.join("generated_plot.png");
 
     let output = Command::new(binary_path())
-        .args([
-            "--lang",
-            "r",
-            "-e",
-            "plot(1:10, 1:10, main='CLI Plot Test')",
-            "--out-plot",
-            plot_file.to_str().expect("valid path"),
-        ])
+        .args(["--lang", "r", "-e", "plot(1:10, 1:10, main='CLI Plot Test')", "--out-plot", plot_file.to_str().expect("valid path")])
         .output()
         .expect("failed to execute wc-kernel");
 
     assert!(output.status.success());
     assert!(plot_file.is_file(), "plot file should have been written");
     let bytes = fs::read(&plot_file).expect("read plot file");
-    assert!(
-        bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
-        "file must be a valid PNG"
-    );
+    assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]), "file must be a valid PNG");
 }
 
 #[test]
@@ -611,27 +485,14 @@ fn cli_out_plot_svg_saved() {
     let plot_file = temp_dir.join("generated_plot.svg");
 
     let output = Command::new(binary_path())
-        .args([
-            "--lang",
-            "r",
-            "-e",
-            "plot(1:10, 1:10, main='CLI SVG Test')",
-            "--out-plot",
-            plot_file.to_str().expect("valid path"),
-        ])
+        .args(["--lang", "r", "-e", "plot(1:10, 1:10, main='CLI SVG Test')", "--out-plot", plot_file.to_str().expect("valid path")])
         .output()
         .expect("failed to execute wc-kernel");
 
     assert!(output.status.success());
-    assert!(
-        plot_file.is_file(),
-        "svg plot file should have been written"
-    );
+    assert!(plot_file.is_file(), "svg plot file should have been written");
     let content = fs::read_to_string(&plot_file).expect("read svg plot file");
-    assert!(
-        content.contains("<svg") && content.contains("</svg>"),
-        "file must be a valid SVG"
-    );
+    assert!(content.contains("<svg") && content.contains("</svg>"), "file must be a valid SVG");
 }
 
 #[test]
@@ -642,20 +503,14 @@ fn cli_defaults_to_current_directory() {
     }
 
     let output = Command::new(binary_path())
-        .args([
-            "--lang",
-            "py",
-            "-e",
-            "import os; print(os.path.realpath(os.getcwd()))",
-        ])
+        .args(["--lang", "py", "-e", "import os; print(os.path.realpath(os.getcwd()))"])
         .output()
         .expect("failed to execute wc-kernel");
 
     assert!(output.status.success());
     let printed = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
     let printed = fs::canonicalize(printed).expect("canonical printed dir");
-    let expected = fs::canonicalize(std::env::current_dir().expect("current dir"))
-        .expect("canonical current dir");
+    let expected = fs::canonicalize(std::env::current_dir().expect("current dir")).expect("canonical current dir");
     assert_eq!(printed, expected);
 }
 
@@ -669,18 +524,10 @@ fn cli_file_execution_resolves_sibling_imports() {
     let temp_dir = TestDir::new("wc-sibling-import");
     fs::write(temp_dir.join("helper_module.py"), "VALUE = 42\n").expect("write helper module");
     let script_file = temp_dir.join("main_script.py");
-    fs::write(
-        &script_file,
-        "import helper_module\nprint(helper_module.VALUE)\n",
-    )
-    .expect("write main script");
+    fs::write(&script_file, "import helper_module\nprint(helper_module.VALUE)\n").expect("write main script");
 
     let output = Command::new(binary_path())
-        .args([
-            "--file",
-            script_file.to_str().expect("valid path"),
-            "--no-plot",
-        ])
+        .args(["--file", script_file.to_str().expect("valid path"), "--no-plot"])
         .output()
         .expect("failed to execute wc-kernel");
 
@@ -698,19 +545,13 @@ fn cli_accepts_non_utf8_file_paths() {
     }
 
     let temp_dir = TestDir::new("wc-non-utf8-file");
-    let script_dir = temp_dir
-        .path
-        .join(std::ffi::OsString::from_vec(b"dir-\xff".to_vec()));
+    let script_dir = temp_dir.path.join(std::ffi::OsString::from_vec(b"dir-\xff".to_vec()));
     fs::create_dir(&script_dir).expect("create non-UTF-8 directory");
     fs::write(script_dir.join("helper.py"), "VALUE = 42\n").expect("write helper module");
     let script = script_dir.join("script.py");
     fs::write(&script, "import helper\nprint(helper.VALUE)\n").expect("write script");
 
-    let output = Command::new(binary_path())
-        .args(["--no-plot", "--file"])
-        .arg(&script)
-        .output()
-        .expect("run CLI");
+    let output = Command::new(binary_path()).args(["--no-plot", "--file"]).arg(&script).output().expect("run CLI");
 
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
@@ -743,8 +584,7 @@ fn cli_export_error_still_emits_json() {
 
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("result JSON must be emitted before the export error");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("result JSON must be emitted before the export error");
     assert_eq!(json["success"], true);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("failed to create directory"));
@@ -758,14 +598,7 @@ fn cli_reports_truncated_output_in_json() {
     }
 
     let output = Command::new(binary_path())
-        .args([
-            "--lang",
-            "py",
-            "-e",
-            "import sys; sys.stdout.write('x' * (12 * 1024 * 1024))",
-            "--json",
-            "--no-plot",
-        ])
+        .args(["--lang", "py", "-e", "import sys; sys.stdout.write('x' * (12 * 1024 * 1024))", "--json", "--no-plot"])
         .output()
         .expect("failed to execute wc-kernel");
 
@@ -783,14 +616,7 @@ fn cli_timeout_enforced() {
     }
 
     let output = Command::new(binary_path())
-        .args([
-            "--lang",
-            "py",
-            "-e",
-            "import time\nwhile True:\n    time.sleep(0.05)",
-            "--timeout",
-            "300",
-        ])
+        .args(["--lang", "py", "-e", "import time\nwhile True:\n    time.sleep(0.05)", "--timeout", "300"])
         .output()
         .expect("failed to execute wc-kernel");
 
@@ -816,25 +642,16 @@ fn cli_syntax_error_returns_nonzero_and_json() {
 
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("output must still be valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("output must still be valid JSON");
 
     assert_eq!(json["success"], false);
     assert_ne!(json["exit_code"], 0);
-    assert!(
-        json["stderr"]
-            .as_str()
-            .expect("stderr string")
-            .contains("SyntaxError")
-    );
+    assert!(json["stderr"].as_str().expect("stderr string").contains("SyntaxError"));
 }
 
 #[test]
 fn cli_invalid_arguments_handled() {
-    let output = Command::new(binary_path())
-        .args(["--nonexistent-option"])
-        .output()
-        .expect("failed to execute wc-kernel");
+    let output = Command::new(binary_path()).args(["--nonexistent-option"]).output().expect("failed to execute wc-kernel");
 
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -843,10 +660,7 @@ fn cli_invalid_arguments_handled() {
 
 #[test]
 fn cli_missing_language_handled() {
-    let output = Command::new(binary_path())
-        .args(["-e", "print(1)"])
-        .output()
-        .expect("failed to execute wc-kernel");
+    let output = Command::new(binary_path()).args(["-e", "print(1)"]).output().expect("failed to execute wc-kernel");
 
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
