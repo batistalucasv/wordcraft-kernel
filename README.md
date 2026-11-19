@@ -302,8 +302,10 @@ Rules that apply to session code:
   R background subprocess after its chunk returns is discarded while the session is idle;
   R cannot portably redirect an inherited descriptor, so a later active chunk may see a
   write made by that background process.
-- A chunk that exceeds `timeout_ms` terminates the daemon process tree; the call returns
-  `timed_out` and the next call for that id starts a fresh interpreter.
+- A chunk that exceeds `timeout_ms` closes the session: the call returns `timed_out`
+  and the next call for that id starts a fresh interpreter. Persistent sessions do not use
+  `wc-kernel-supervisor`; on Unix, cleanup signals the interpreter's process group, so a
+  worker that has created its own session or process group can survive.
 - Session ids belong to one language. Reusing an id with another language
   returns `KernelError::SessionLanguageMismatch`.
 - `idle_timeout` defaults to ten minutes. A zero timeout disables reaping. Idle

@@ -8,17 +8,24 @@
 //!
 //! # Wire protocol
 //!
-//! The host writes one length-prefixed request on the daemon's stdin:
+//! Both drivers read one length-prefixed request from their protocol channel
+//! (Python stdin or the authenticated R socket):
 //!
 //! ```text
-//! RUN <seq> <capture:0|1> <format:png|svg|both|none> <cwd_bytes_len> <code_bytes_len>\n
+//! RUN <seq> <capture:0|1> <format:png|svg|both|none> <cwd_bytes_len> <code_bytes_len> <paths_bytes_len>\n
 //! <cwd_bytes>
 //! <code_bytes>
+//! <paths_blob>
 //! ```
 //!
-//! Because the exact byte lengths of the working directory and code payload are specified
-//! in the header, arbitrary user code (including lines matching protocol words, multiline
-//! strings, or non-ASCII characters) can never collide with or terminate framing.
+//! `<paths_blob>` is a sequence of `u32` little-endian length prefixes followed by
+//! the Python search-path bytes. The R driver reads and ignores the blob and always
+//! sends a length of zero, because `python_path` applies only to Python sessions.
+//!
+//! Because the exact byte lengths of the working directory, code payload and search
+//! paths are specified in the header, arbitrary user code (including lines matching
+//! protocol words, multiline strings, or non-ASCII characters) can never collide with
+//! or terminate framing.
 //!
 //! The daemon evaluates the code in its execution environment, writes
 //! `out-<seq>.txt`, `err-<seq>.txt`, `status-<seq>.txt` and, when a plot was
@@ -608,6 +615,10 @@ impl ChildGuard {
         if let Some(child) = self.child.as_mut() { child.try_wait() } else { Ok(None) }
     }
 
+    fn child_mut(&mut self) -> Option<&mut Child> {
+        self.child.as_mut()
+    }
+
     fn into_child(mut self) -> Option<Child> {
         self.pgid.take();
         self.child.take()
@@ -750,10 +761,24 @@ impl Session {
 
         let stderr_path = temp_dir.join("driver-stderr.txt");
 
+        let work_dir = temp_dir.join("work");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&work_dir)
+                .map_err(|e| KernelError::Io(format!("create session work dir {}: {e}", work_dir.display())))?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir(&work_dir).map_err(|e| KernelError::Io(format!("create session work dir {}: {e}", work_dir.display())))?;
+        }
+
         let mut capture: Option<Arc<StreamCapture>> = None;
 
         let mut command = Command::new(binary);
-        let (mut child, input, protocol_socket) = match language {
+        let (mut child_guard, input, protocol_socket) = match language {
             CodeLanguage::Python => {
                 let stderr_file = File::create(&stderr_path).map_err(|e| KernelError::Io(format!("create {}: {e}", stderr_path.display())))?;
                 command.arg("-u");
@@ -763,7 +788,7 @@ impl Session {
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::from(stderr_file))
-                    .current_dir(temp_dir)
+                    .current_dir(&work_dir)
                     .env("TMPDIR", temp_dir)
                     .env("TEMP", temp_dir)
                     .env("TMP", temp_dir);
@@ -774,10 +799,13 @@ impl Session {
                     command.process_group(0);
                 }
 
-                let mut child = command.spawn().map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?;
+                let mut child_guard = ChildGuard::new(command.spawn().map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?);
 
-                let stdin = child.stdin.take().ok_or_else(|| KernelError::SessionProtocol("interpreter stdin pipe was not created".to_string()))?;
-                (child, Some(SessionInput::Pipe(stdin)), None)
+                let stdin = child_guard
+                    .child_mut()
+                    .and_then(|child| child.stdin.take())
+                    .ok_or_else(|| KernelError::SessionProtocol("interpreter stdin pipe was not created".to_string()))?;
+                (child_guard, Some(SessionInput::Pipe(stdin)), None)
             }
             CodeLanguage::R => {
                 let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| KernelError::Io(format!("bind R session socket: {e}")))?;
@@ -794,7 +822,7 @@ impl Session {
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
-                    .current_dir(temp_dir)
+                    .current_dir(&work_dir)
                     .env("TMPDIR", temp_dir)
                     .env("TEMP", temp_dir)
                     .env("TMP", temp_dir)
@@ -806,10 +834,16 @@ impl Session {
                     command.process_group(0);
                 }
 
-                let mut child = command.spawn().map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?;
+                let mut child_guard = ChildGuard::new(command.spawn().map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?);
 
-                let stdout = child.stdout.take().ok_or_else(|| KernelError::SessionProtocol("R stdout pipe was not created".to_string()))?;
-                let stderr = child.stderr.take().ok_or_else(|| KernelError::SessionProtocol("R stderr pipe was not created".to_string()))?;
+                let stdout = child_guard
+                    .child_mut()
+                    .and_then(|child| child.stdout.take())
+                    .ok_or_else(|| KernelError::SessionProtocol("R stdout pipe was not created".to_string()))?;
+                let stderr = child_guard
+                    .child_mut()
+                    .and_then(|child| child.stderr.take())
+                    .ok_or_else(|| KernelError::SessionProtocol("R stderr pipe was not created".to_string()))?;
                 let mut stream_capture = StreamCapture::new();
                 #[cfg(unix)]
                 {
@@ -818,12 +852,16 @@ impl Session {
                 }
                 let stream_capture = Arc::new(stream_capture);
                 let writer = Arc::clone(&stream_capture);
-                std::thread::spawn(move || pump_stream(stdout, CaptureStream::Stdout, writer));
+                std::thread::Builder::new()
+                    .name("wc-session-r-stdout".to_string())
+                    .spawn(move || pump_stream(stdout, CaptureStream::Stdout, writer))
+                    .map_err(|e| KernelError::Io(format!("spawn R stdout pump: {e}")))?;
                 let writer = Arc::clone(&stream_capture);
-                std::thread::spawn(move || pump_stream(stderr, CaptureStream::Stderr, writer));
+                std::thread::Builder::new()
+                    .name("wc-session-r-stderr".to_string())
+                    .spawn(move || pump_stream(stderr, CaptureStream::Stderr, writer))
+                    .map_err(|e| KernelError::Io(format!("spawn R stderr pump: {e}")))?;
                 capture = Some(stream_capture);
-
-                let mut child_guard = ChildGuard::new(child);
 
                 listener.set_nonblocking(true).map_err(|e| KernelError::Io(format!("set nonblocking on R listener: {e}")))?;
                 let deadline = Instant::now() + STARTUP_TIMEOUT;
@@ -863,19 +901,27 @@ impl Session {
                     }
                 };
                 let protocol_socket = stream.try_clone().map_err(|e| KernelError::Io(format!("clone R protocol socket: {e}")))?;
-                let child =
-                    child_guard.into_child().ok_or_else(|| KernelError::SessionProtocol("child process was dropped unexpectedly".to_string()))?;
-                (child, Some(SessionInput::Socket(stream)), Some(protocol_socket))
+                (child_guard, Some(SessionInput::Socket(stream)), Some(protocol_socket))
             }
         };
 
-        let pgid = Mutex::new(Some(child.id()));
         let (sender, lines) = mpsc::sync_channel(256);
         let protocol_reader: Box<dyn Read + Send> = match protocol_socket {
             Some(stream) => Box::new(stream),
-            None => Box::new(child.stdout.take().ok_or_else(|| KernelError::SessionProtocol("interpreter stdout pipe was not created".to_string()))?),
+            None => Box::new(
+                child_guard
+                    .child_mut()
+                    .and_then(|child| child.stdout.take())
+                    .ok_or_else(|| KernelError::SessionProtocol("interpreter stdout pipe was not created".to_string()))?,
+            ),
         };
-        std::thread::spawn(move || pump_protocol_lines(protocol_reader, sender));
+        std::thread::Builder::new()
+            .name("wc-session-protocol".to_string())
+            .spawn(move || pump_protocol_lines(protocol_reader, sender))
+            .map_err(|e| KernelError::Io(format!("spawn session protocol reader: {e}")))?;
+
+        let child = child_guard.into_child().ok_or_else(|| KernelError::SessionProtocol("child process was dropped unexpectedly".to_string()))?;
+        let pgid = Mutex::new(Some(child.id()));
 
         Ok(Self {
             id: session_id.to_string(),
@@ -935,10 +981,14 @@ impl Session {
         let format_string = format.to_string();
         let capture_flag = request.capture_plots;
 
-        std::thread::spawn(move || {
+        let writer = std::thread::Builder::new().name("wc-session-request-writer".to_string()).spawn(move || {
             let res = write_chunk_payload(&mut input_pipe, seq, capture_flag, &format_string, &cwd_string, &code, &python_paths);
             let _ = send_tx.send((input_pipe, res));
         });
+        if let Err(error) = writer {
+            self.kill();
+            return Err(KernelError::Io(format!("spawn session request writer: {error}")));
+        }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         let write_res = if remaining.is_zero() {
@@ -1628,6 +1678,26 @@ except Exception:
     plt = None
     Gcf = None
 
+def refresh_matplotlib():
+    """Retry the driver imports when a request path makes Matplotlib available."""
+    global plt, Gcf
+    if plt is not None:
+        return
+    try:
+        import matplotlib
+        if "matplotlib.pyplot" not in sys.modules:
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt_module
+        plt = plt_module
+        try:
+            from matplotlib._pylab_helpers import Gcf as Gcf_module
+            Gcf = Gcf_module
+        except Exception:
+            Gcf = None
+    except Exception:
+        plt = None
+        Gcf = None
+
 USER_MOD = types.ModuleType("__main__")
 USER_MOD.__file__ = "<wordcraft-chunk>"
 sys.modules["__main__"] = USER_MOD
@@ -1819,8 +1889,9 @@ def main():
         sys.stderr = STABLE_STDERR
 
         status = "ok"
-        before_figures = snapshot_figures()
-        drawn_figures, draw_restorers = track_figure_draws()
+        before_figures = {}
+        drawn_figures = set()
+        draw_restorers = []
 
         try:
             if cwd:
@@ -1833,11 +1904,15 @@ def main():
             for path in requested_paths:
                 if path in sys.path:
                     original_positions[path] = sys.path.index(path)
-            for path in reversed(requested_paths):
-                while path in sys.path:
-                    sys.path.remove(path)
-                sys.path.insert(0, path)
             try:
+                for path in reversed(requested_paths):
+                    while path in sys.path:
+                        sys.path.remove(path)
+                    sys.path.insert(0, path)
+                if requested_paths:
+                    refresh_matplotlib()
+                before_figures = snapshot_figures()
+                drawn_figures, draw_restorers = track_figure_draws()
                 exec(compile(code + "\n", "<wordcraft-chunk>", "exec"), NAMESPACE)
             finally:
                 for path in requested_paths:
@@ -2288,14 +2363,14 @@ mod tests {
         let mut command = Command::new("sh");
         command.arg(&script).env("WC_READY", &ready).env("WC_MARKER", &marker).stdout(Stdio::null()).stderr(Stdio::null());
         command.process_group(0);
-        let child = command.spawn().expect("spawn leader");
+        let child = ChildGuard::new(command.spawn().expect("spawn leader"));
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while !ready.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(ready.exists(), "the background worker must report readiness before the guard is dropped");
-        drop(ChildGuard::new(child));
+        drop(child);
 
         std::thread::sleep(Duration::from_millis(900));
         assert!(!marker.exists(), "the startup guard must reap the interpreter process group");

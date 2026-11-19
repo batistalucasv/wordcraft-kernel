@@ -465,12 +465,8 @@ fn python_session_uses_request_python_path() {
         return;
     };
 
-    let module_dir = std::env::temp_dir().join(format!(
-        "wordcraft-python-path-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|elapsed| elapsed.as_nanos()).unwrap_or(0)
-    ));
-    fs::create_dir(&module_dir).expect("create module dir");
+    let module_fixture = TempDirGuard::new("wordcraft-python-path");
+    let module_dir = module_fixture.path().to_path_buf();
     fs::write(module_dir.join("wc_session_probe.py"), b"VALUE = 'from-request-path'\n").expect("write probe module");
 
     let request = chunk(CodeLanguage::Python, "import wc_session_probe; print(wc_session_probe.VALUE)").with_python_path(&module_dir);
@@ -486,7 +482,6 @@ fn python_session_uses_request_python_path() {
     assert_eq!(probe_result.stdout.trim(), "False");
 
     manager.close_session("py-path");
-    let _ = fs::remove_dir_all(&module_dir);
 }
 
 #[test]
@@ -532,6 +527,45 @@ fn session_temp_dir_has_restricted_permissions() {
     }
 
     manager.close_session("perm-test");
+}
+
+#[test]
+fn session_chunks_run_in_a_private_work_directory() {
+    let Some(mut manager) = manager_for(CodeLanguage::Python) else {
+        return;
+    };
+    let result = manager.execute("py-workdir", &chunk(CodeLanguage::Python, "import os; print(os.getcwd())")).expect("execute python cwd");
+    assert!(result.success, "stderr: {}", result.stderr);
+    let reported = PathBuf::from(result.stdout.trim());
+    let temp_dir = manager.temp_dir_for_test("py-workdir").expect("python session temp dir").to_path_buf();
+    let work_dir = temp_dir.join("work");
+    let expected = work_dir.canonicalize().unwrap_or_else(|_| work_dir.clone());
+    let actual = reported.canonicalize().unwrap_or(reported);
+    assert_eq!(actual, expected, "Python chunks must run in the dedicated work directory");
+    assert!(temp_dir.join("driver.py").is_file(), "the Python driver must stay in the artifact directory");
+    assert!(!work_dir.join("driver.py").exists(), "the Python driver must not be exposed in the work directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&work_dir).expect("work dir metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "work directory must have 0700 permissions, got 0{:o}", mode);
+    }
+    manager.close_session("py-workdir");
+
+    let Some(mut manager) = manager_for(CodeLanguage::R) else {
+        return;
+    };
+    let result = manager.execute("r-workdir", &chunk(CodeLanguage::R, "cat(getwd())")).expect("execute R cwd");
+    assert!(result.success, "stderr: {}", result.stderr);
+    let reported = PathBuf::from(result.stdout.trim());
+    let temp_dir = manager.temp_dir_for_test("r-workdir").expect("R session temp dir").to_path_buf();
+    let work_dir = temp_dir.join("work");
+    let expected = work_dir.canonicalize().unwrap_or_else(|_| work_dir.clone());
+    let actual = reported.canonicalize().unwrap_or(reported);
+    assert_eq!(actual, expected, "R chunks must run in the dedicated work directory");
+    assert!(temp_dir.join("driver.R").is_file(), "the R driver must stay in the artifact directory");
+    assert!(!work_dir.join("driver.R").exists(), "the R driver must not be exposed in the work directory");
+    manager.close_session("r-workdir");
 }
 
 #[test]
@@ -1188,8 +1222,12 @@ fn python_collectors_release_descriptors_between_chunks() {
     assert!(manager.execute("py-fds", &warm).expect("warm").success);
     let pid =
         manager.active_sessions().into_iter().find(|session| session.session_id == "py-fds").and_then(|session| session.pid).expect("session pid");
-    let count_fds = || fs::read_dir(format!("/proc/{pid}/fd")).map(|entries| entries.count()).unwrap_or(0);
-    let baseline = count_fds();
+    let count_fds = || fs::read_dir(format!("/proc/{pid}/fd")).map(|entries| entries.count());
+    let Ok(baseline) = count_fds() else {
+        eprintln!("skipping descriptor leak check: /proc/{pid}/fd is unavailable");
+        manager.close_session("py-fds");
+        return;
+    };
 
     for _ in 0..5 {
         let code = "import subprocess, sys\nsubprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)'])";
@@ -1197,7 +1235,7 @@ fn python_collectors_release_descriptors_between_chunks() {
         assert!(res.success, "stderr: {}", res.stderr);
     }
 
-    let after = count_fds();
+    let after = count_fds().expect("read final descriptor count");
     assert!(after <= baseline + 4, "collector descriptors leaked: baseline {baseline}, after {after}");
     manager.close_session("py-fds");
 }

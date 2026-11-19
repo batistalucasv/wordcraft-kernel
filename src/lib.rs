@@ -262,8 +262,11 @@ pub struct ExecutionResult {
     /// process status; for persistent sessions ([`SessionManager`]), it indicates the status of the evaluated chunk
     /// without ending the long-running daemon interpreter.
     pub exit_code: Option<i32>,
-    /// Whether the execution completed cleanly. For persistent sessions, a failed chunk returns `false`
-    /// without terminating the interpreter session.
+    /// Whether the execution completed cleanly. For persistent sessions, an ordinary evaluation
+    /// error returns `false` without terminating the interpreter session, so the next chunk can
+    /// reuse its state. A timeout also returns `false`, but [`SessionManager::execute`] removes
+    /// the session; after a timeout the previous state is not reusable, and the next request for
+    /// that id starts a fresh interpreter.
     pub success: bool,
     /// True if execution was halted due to timeout limit.
     pub timed_out: bool,
