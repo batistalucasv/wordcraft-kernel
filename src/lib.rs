@@ -17,20 +17,22 @@ pub mod templates;
 
 use std::fmt;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use command_group::{CommandGroup, GroupChild};
 use serde::{Deserialize, Serialize};
 
 static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Maximum bytes kept from each captured stream (stdout and stderr).
-const MAX_CAPTURE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_CAPTURE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Programming language for a code chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -391,14 +393,6 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    // Run the interpreter in its own process group so descendants holding the
-    // capture pipes can be stopped before the readers are joined.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-
     if let Some(ref dir) = request.working_dir {
         cmd.current_dir(dir);
     } else {
@@ -417,24 +411,64 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
 
     let start_time = Instant::now();
     let mut child = cmd
-        .spawn()
+        .group_spawn()
         .map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?;
 
-    let capture_limit = usize::try_from(MAX_CAPTURE_BYTES).unwrap_or(usize::MAX);
-    let (stdout_sink, stdout_done) = match child.stdout.take() {
-        Some(pipe) => {
-            let (sink, done) = spawn_capture(pipe, capture_limit);
-            (sink, Some(done))
-        }
-        None => (CaptureSink::new(), None),
+    let stdout_pipe = child.inner().stdout.take();
+    let stderr_pipe = child.inner().stderr.take();
+    let (Some(stdout_pipe), Some(stderr_pipe)) = (stdout_pipe, stderr_pipe) else {
+        let cleanup = terminate_process_group(&mut child)
+            .err()
+            .map(|error| format!("; stop process group: {error}"))
+            .unwrap_or_default();
+        return Err(KernelError::Io(format!(
+            "interpreter output pipes were not created{cleanup}"
+        )));
     };
-    let (stderr_sink, stderr_done) = match child.stderr.take() {
-        Some(pipe) => {
-            let (sink, done) = spawn_capture(pipe, capture_limit);
-            (sink, Some(done))
-        }
-        None => (CaptureSink::new(), None),
-    };
+
+    if let Err(e) =
+        set_pipe_nonblocking(&stdout_pipe).and_then(|()| set_pipe_nonblocking(&stderr_pipe))
+    {
+        let cleanup = terminate_process_group(&mut child)
+            .err()
+            .map(|error| format!("; stop process group: {error}"))
+            .unwrap_or_default();
+        return Err(KernelError::Io(format!(
+            "configure output capture pipes: {e}{cleanup}"
+        )));
+    }
+
+    let (stdout_sink, stdout_cancel, stdout_reader) =
+        match spawn_capture(stdout_pipe, MAX_CAPTURE_BYTES) {
+            Ok(reader) => reader,
+            Err(e) => {
+                let cleanup = terminate_process_group(&mut child)
+                    .err()
+                    .map(|cleanup| format!("; stop process group: {cleanup}"))
+                    .unwrap_or_default();
+                return Err(KernelError::Io(format!(
+                    "start stdout capture: {e}{cleanup}"
+                )));
+            }
+        };
+    let (stderr_sink, stderr_cancel, stderr_reader) =
+        match spawn_capture(stderr_pipe, MAX_CAPTURE_BYTES) {
+            Ok(reader) => reader,
+            Err(e) => {
+                let cleanup = terminate_process_group(&mut child)
+                    .err()
+                    .map(|cleanup| format!("; stop process group: {cleanup}"))
+                    .unwrap_or_default();
+                stdout_cancel.store(true, Ordering::Release);
+                let reader_cleanup = join_capture_reader(stdout_reader, "stdout")
+                    .err()
+                    .map(|cleanup| format!("; finish stdout capture: {cleanup}"))
+                    .unwrap_or_default();
+                return Err(KernelError::Io(format!(
+                    "start stderr capture: {e}{cleanup}{reader_cleanup}"
+                )));
+            }
+        };
 
     let outcome = wait_with_timeout(
         &mut child,
@@ -444,15 +478,17 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     );
     let duration_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
-    // Close inherited pipe writers before joining the readers.
-    stop_process_tree(&mut child);
-    let drain_timeout = Duration::from_secs(2);
-    if let Some(done) = stdout_done {
-        let _ = done.recv_timeout(drain_timeout);
-    }
-    if let Some(done) = stderr_done {
-        let _ = done.recv_timeout(drain_timeout);
-    }
+    // Terminate remaining group members, then cancel readers that still see
+    // open pipe writers outside the group.
+    let stop_result = terminate_process_group(&mut child);
+    stdout_cancel.store(true, Ordering::Release);
+    stderr_cancel.store(true, Ordering::Release);
+    let stdout_result = join_capture_reader(stdout_reader, "stdout");
+    let stderr_result = join_capture_reader(stderr_reader, "stderr");
+    let outcome = outcome.map_err(|e| KernelError::Io(format!("wait for interpreter: {e}")))?;
+    stop_result.map_err(|e| KernelError::Io(format!("stop interpreter process group: {e}")))?;
+    stdout_result?;
+    stderr_result?;
 
     let stdout = stdout_sink.text();
     let stderr = stderr_sink.text();
@@ -526,39 +562,77 @@ impl CaptureSink {
 ///
 /// Once `limit` bytes are kept, the read end is dropped so further writes fail
 /// instead of growing the capture.
-fn spawn_capture<R>(mut pipe: R, limit: usize) -> (CaptureSink, std::sync::mpsc::Receiver<()>)
+fn spawn_capture<R>(
+    mut pipe: R,
+    limit: usize,
+) -> io::Result<(CaptureSink, Arc<AtomicBool>, JoinHandle<io::Result<()>>)>
 where
     R: Read + Send + 'static,
 {
     let sink = CaptureSink::new();
     let thread_sink = sink.clone();
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut chunk = [0u8; 8192];
-        loop {
-            match pipe.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(read) => {
-                    let mut bytes = thread_sink
-                        .bytes
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let remaining = limit.saturating_sub(bytes.len());
-                    if read > remaining {
-                        bytes.extend_from_slice(&chunk[..remaining]);
-                        drop(bytes);
-                        thread_sink.truncated.store(true, Ordering::Relaxed);
-                        break;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let thread_cancel = Arc::clone(&cancel);
+    let reader = thread::Builder::new()
+        .name("wordcraft-output-capture".to_string())
+        .spawn(move || -> io::Result<()> {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => return Ok(()),
+                    Ok(read) => {
+                        let mut bytes = thread_sink
+                            .bytes
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let remaining = limit.saturating_sub(bytes.len());
+                        if read > remaining {
+                            bytes.extend_from_slice(&chunk[..remaining]);
+                            drop(bytes);
+                            thread_sink.truncated.store(true, Ordering::Relaxed);
+                            return Ok(());
+                        }
+                        bytes.extend_from_slice(&chunk[..read]);
                     }
-                    bytes.extend_from_slice(&chunk[..read]);
+                    Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if thread_cancel.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
             }
-        }
-        let _ = done_tx.send(());
-    });
-    (sink, done_rx)
+        })?;
+    Ok((sink, cancel, reader))
+}
+
+#[cfg(unix)]
+fn set_pipe_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+
+    let flags = fcntl(pipe.as_raw_fd(), FcntlArg::F_GETFL).map_err(io::Error::other)?;
+    let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+    fcntl(pipe.as_raw_fd(), FcntlArg::F_SETFL(flags))
+        .map(|_| ())
+        .map_err(io::Error::other)
+}
+
+#[cfg(not(unix))]
+fn set_pipe_nonblocking(_pipe: &impl Read) -> io::Result<()> {
+    Ok(())
+}
+
+fn join_capture_reader(
+    reader: JoinHandle<io::Result<()>>,
+    stream: &str,
+) -> Result<(), KernelError> {
+    match reader.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(KernelError::Io(format!("read {stream} capture: {e}"))),
+        Err(_) => Err(KernelError::Io(format!("{stream} capture thread panicked"))),
+    }
 }
 
 struct WaitOutcome {
@@ -567,77 +641,66 @@ struct WaitOutcome {
     output_limited: bool,
 }
 
-/// Wait for the child, killing it on timeout or when a capture hits its limit.
+/// Wait for the child until timeout or a capture limit is reached.
 fn wait_with_timeout(
-    child: &mut Child,
+    child: &mut GroupChild,
     timeout: Duration,
     stdout_sink: &CaptureSink,
     stderr_sink: &CaptureSink,
-) -> WaitOutcome {
+) -> io::Result<WaitOutcome> {
     let start = Instant::now();
     let step = Duration::from_millis(10);
 
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                return WaitOutcome {
+                return Ok(WaitOutcome {
                     status: Some(status),
                     timed_out: false,
                     output_limited: false,
-                };
+                });
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    stop_process_tree(child);
-                    return WaitOutcome {
+                    return Ok(WaitOutcome {
                         status: None,
                         timed_out: true,
                         output_limited: stdout_sink.is_truncated() || stderr_sink.is_truncated(),
-                    };
+                    });
                 }
                 if stdout_sink.is_truncated() || stderr_sink.is_truncated() {
-                    if let Ok(Some(status)) = child.try_wait() {
-                        return WaitOutcome {
-                            status: Some(status),
-                            timed_out: false,
-                            output_limited: true,
-                        };
-                    }
-                    stop_process_tree(child);
-                    return WaitOutcome {
-                        status: None,
+                    return Ok(WaitOutcome {
+                        status: child.try_wait()?,
                         timed_out: false,
                         output_limited: true,
-                    };
+                    });
                 }
                 std::thread::sleep(step);
             }
-            Err(_) => {
-                stop_process_tree(child);
-                return WaitOutcome {
-                    status: None,
-                    timed_out: false,
-                    output_limited: false,
-                };
-            }
+            Err(error) => return Err(error),
         }
     }
 }
 
-/// Stop the interpreter and any descendants sharing its process group.
-fn stop_process_tree(child: &mut Child) {
-    let pid = child.id();
-    #[cfg(unix)]
-    let _ = Command::new("kill")
-        .arg("-KILL")
-        .arg(format!("-{pid}"))
-        .status();
-    #[cfg(windows)]
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .status();
-    let _ = child.kill();
-    let _ = child.wait();
+/// Stop the interpreter and any descendants managed by its process group.
+fn terminate_process_group(child: &mut GroupChild) -> io::Result<Option<ExitStatus>> {
+    let status = child.try_wait();
+    match child.kill() {
+        Ok(()) => child.wait().map(Some),
+        Err(kill_error) => match status {
+            Ok(Some(_)) => child.wait().map(Some),
+            Ok(None) => match child.try_wait() {
+                Ok(Some(_)) => child.wait().map(Some),
+                Ok(None) => Err(kill_error),
+                Err(wait_error) => Err(io::Error::other(format!(
+                    "kill process group: {kill_error}; check child status: {wait_error}"
+                ))),
+            },
+            Err(wait_error) => Err(io::Error::other(format!(
+                "kill process group: {kill_error}; check child status: {wait_error}"
+            ))),
+        },
+    }
 }
 
 /// Whether `content` is a non-trivial and complete SVG document.

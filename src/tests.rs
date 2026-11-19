@@ -184,14 +184,17 @@ fn python_timeout_preserves_partial_stdout() {
 
 #[test]
 fn capture_sink_caps_single_burst() {
-    let burst = vec![b'x'; MAX_CAPTURE_BYTES as usize + 1024];
-    let (sink, done) = spawn_capture(std::io::Cursor::new(burst), MAX_CAPTURE_BYTES as usize);
+    let burst = vec![b'x'; MAX_CAPTURE_BYTES + 1024];
+    let (sink, _, reader) = spawn_capture(std::io::Cursor::new(burst), MAX_CAPTURE_BYTES)
+        .expect("start capture reader");
 
-    done.recv_timeout(Duration::from_secs(1))
-        .expect("capture reader must finish");
+    reader
+        .join()
+        .expect("capture reader must not panic")
+        .expect("capture reader must succeed");
 
     assert!(sink.is_truncated());
-    assert_eq!(sink.text().len() as u64, MAX_CAPTURE_BYTES);
+    assert_eq!(sink.text().len(), MAX_CAPTURE_BYTES);
 }
 
 #[test]
@@ -205,7 +208,7 @@ fn python_output_budget_limits_capture() {
     let result = execute(&req).expect("execution failed");
 
     assert!(result.output_truncated);
-    assert!(result.stdout.len() as u64 <= MAX_CAPTURE_BYTES);
+    assert!(result.stdout.len() <= MAX_CAPTURE_BYTES);
 }
 
 #[test]
@@ -225,6 +228,40 @@ subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
 
     assert!(result.success);
     assert!(result.stdout.contains("ready"));
+}
+
+#[cfg(unix)]
+#[test]
+fn python_output_reader_stops_when_descendant_escapes_process_group() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    let code = r#"
+import subprocess, sys
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(30)"],
+    start_new_session=True,
+)
+print(child.pid, flush=True)
+"#;
+    let started = std::time::Instant::now();
+    let req = ExecutionRequest::new(CodeLanguage::Python, code).with_plot_capture(false);
+    let result = execute(&req).expect("execution failed");
+
+    let child_pid = result
+        .stdout
+        .trim()
+        .parse::<u32>()
+        .expect("print child pid");
+    let child_pid = child_pid.to_string();
+    let status = Command::new("kill")
+        .args(["-KILL", child_pid.as_str()])
+        .status()
+        .expect("kill escaped test child");
+    assert!(status.success());
+    assert!(result.success);
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
 }
 
 #[test]
