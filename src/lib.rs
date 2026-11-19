@@ -265,13 +265,7 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
             binary: request.language.binary_name(),
         })?;
 
-    let unique_id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let temp_dir = std::env::temp_dir().join(format!(
-        "wordcraft-chunk-{}-{}",
-        std::process::id(),
-        unique_id
-    ));
-    let workspace = TempWorkspace::create(temp_dir)?;
+    let workspace = TempWorkspace::create_exclusive()?;
     let temp_dir = workspace.path();
 
     let plot_png_path = temp_dir.join("__wordcraft_plot__.png");
@@ -369,18 +363,41 @@ struct TempWorkspace {
 }
 
 impl TempWorkspace {
-    fn create(path: PathBuf) -> Result<Self, KernelError> {
+    fn create_exclusive() -> Result<Self, KernelError> {
+        for _ in 0..8 {
+            let unique_id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "wordcraft-chunk-{}-{}",
+                std::process::id(),
+                unique_id
+            ));
+            match Self::create(&path) {
+                Ok(workspace) => return Ok(workspace),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(KernelError::Io(format!(
+                        "create temp dir {}: {e}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        Err(KernelError::Io(
+            "could not create an exclusive temporary directory".to_string(),
+        ))
+    }
+
+    fn create(path: &Path) -> std::io::Result<Self> {
         let mut builder = fs::DirBuilder::new();
-        builder.recursive(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
-        builder
-            .create(&path)
-            .map_err(|e| KernelError::Io(format!("create temp dir {}: {e}", path.display())))?;
-        Ok(Self { path })
+        builder.create(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
     }
 
     fn path(&self) -> &Path {
@@ -397,7 +414,7 @@ impl Drop for TempWorkspace {
 /// Create an owner-only capture file for a child stream.
 fn create_capture_file(path: &Path) -> std::io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
