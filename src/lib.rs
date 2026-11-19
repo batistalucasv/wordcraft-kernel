@@ -21,7 +21,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use command_group::{CommandGroup, GroupChild};
@@ -289,6 +289,9 @@ pub enum KernelError {
     #[error("The wc-kernel-supervisor helper was not found")]
     SupervisorNotFound,
 
+    #[error("execution interrupted")]
+    Interrupted,
+
     #[error("I/O error during execution: {0}")]
     Io(String),
 
@@ -335,6 +338,18 @@ pub fn which_binary(language: CodeLanguage) -> Option<PathBuf> {
 
 /// Execute a code chunk and collect outputs.
 pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelError> {
+    execute_with_cancellation(request, &AtomicBool::new(false))
+}
+
+/// Execute a code chunk, stopping the supervisor when `cancelled` becomes true.
+pub fn execute_with_cancellation(
+    request: &ExecutionRequest,
+    cancelled: &AtomicBool,
+) -> Result<ExecutionResult, KernelError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(KernelError::Interrupted);
+    }
+
     let binary =
         which_binary(request.language).ok_or_else(|| KernelError::InterpreterNotFound {
             language: request.language,
@@ -398,6 +413,7 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
 
     let supervisor = find_supervisor_binary(request.supervisor_path.as_deref())?;
     let result_file = temp_dir.join("__wordcraft_result__.bin");
+    let supervisor_stderr_path = temp_dir.join("__wordcraft_supervisor_stderr__.log");
     let mut cmd = Command::new(&supervisor);
     cmd.arg("--run")
         .arg(&binary)
@@ -417,7 +433,14 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     }
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::piped());
+    cmd.stderr(Stdio::from(
+        create_private_file(&supervisor_stderr_path).map_err(|error| {
+            KernelError::Io(format!(
+                "create supervisor diagnostic file {}: {error}",
+                supervisor_stderr_path.display()
+            ))
+        })?,
+    ));
 
     if let Some(ref dir) = request.working_dir {
         cmd.current_dir(dir);
@@ -430,20 +453,27 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
         .map_err(|e| KernelError::Io(format!("spawn supervisor {}: {e}", supervisor.display())))?;
     let supervisor_timeout =
         Duration::from_millis(request.timeout_ms).saturating_add(Duration::from_secs(5));
-    let status = match wait_for_supervisor(&mut child, supervisor_timeout) {
+    let status = match wait_for_supervisor(&mut child, supervisor_timeout, cancelled) {
         Ok(status) => status,
         Err(error) => {
-            let cleanup = terminate_supervisor_process_group(&mut child)
+            let cleanup = terminate_supervisor_process_group(&mut child);
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                cleanup.map_err(|cleanup| {
+                    KernelError::Io(format!("execution interrupted; cleanup failed: {cleanup}"))
+                })?;
+                return Err(KernelError::Interrupted);
+            }
+            let cleanup_message = cleanup
                 .err()
                 .map(|cleanup| format!("; cleanup failed: {cleanup}"))
                 .unwrap_or_default();
-            let stderr = read_supervisor_stderr(&mut child).map_err(|read_error| {
+            let stderr = read_supervisor_stderr(&supervisor_stderr_path).map_err(|read_error| {
                 KernelError::Io(format!(
-                    "supervisor failed: {error}{cleanup}; read diagnostics: {read_error}"
+                    "supervisor failed: {error}{cleanup_message}; read diagnostics: {read_error}"
                 ))
             })?;
             return Err(KernelError::Io(format!(
-                "supervisor failed: {error}{cleanup}{}",
+                "supervisor failed: {error}{cleanup_message}{}",
                 if stderr.is_empty() {
                     String::new()
                 } else {
@@ -452,7 +482,7 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
             )));
         }
     };
-    let stderr = read_supervisor_stderr(&mut child)
+    let stderr = read_supervisor_stderr(&supervisor_stderr_path)
         .map_err(|e| KernelError::Io(format!("read supervisor diagnostics: {e}")))?;
     if !status.success() {
         return Err(KernelError::Io(format!(
@@ -604,11 +634,18 @@ fn find_supervisor_binary(configured: Option<&Path>) -> Result<PathBuf, KernelEr
 fn wait_for_supervisor(
     child: &mut GroupChild,
     timeout: Duration,
+    cancelled: &AtomicBool,
 ) -> std::io::Result<std::process::ExitStatus> {
     let start = std::time::Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "execution interrupted",
+            ));
         }
         if start.elapsed() >= timeout {
             return Err(std::io::Error::new(
@@ -633,10 +670,19 @@ fn terminate_supervisor_process_group(child: &mut GroupChild) -> std::io::Result
     }
 }
 
-fn read_supervisor_stderr(child: &mut GroupChild) -> std::io::Result<String> {
-    let Some(stderr) = child.inner().stderr.take() else {
-        return Ok(String::new());
-    };
+fn create_private_file(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn read_supervisor_stderr(path: &Path) -> std::io::Result<String> {
+    let stderr = fs::File::open(path)?;
     let mut bytes = Vec::new();
     stderr.take(4096).read_to_end(&mut bytes)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())

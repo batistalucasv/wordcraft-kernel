@@ -2,6 +2,29 @@
 
 use super::*;
 
+fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelError> {
+    if request.supervisor_path.is_some() {
+        return super::execute(request);
+    }
+
+    let executable_name = if cfg!(windows) {
+        "wc-kernel-supervisor.exe"
+    } else {
+        "wc-kernel-supervisor"
+    };
+    let supervisor_path = std::env::current_exe().ok().and_then(|path| {
+        path.ancestors()
+            .map(|directory| directory.join(executable_name))
+            .find(|candidate| candidate.is_file())
+    });
+
+    if let Some(path) = supervisor_path {
+        super::execute(&request.clone().with_supervisor_path(path))
+    } else {
+        super::execute(request)
+    }
+}
+
 struct TempTestDir {
     path: PathBuf,
 }
@@ -250,10 +273,11 @@ print(child.pid, flush=True)
         .expect("print child pid");
     let child_pid = child_pid.to_string();
     let status = Command::new("kill")
-        .args(["-KILL", child_pid.as_str()])
+        .args(["-0", child_pid.as_str()])
+        .stderr(Stdio::null())
         .status()
-        .expect("kill escaped test child");
-    assert!(status.success());
+        .expect("check escaped test child");
+    assert!(!status.success(), "escaped descendant remained alive");
     assert!(result.success);
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
 }
@@ -457,11 +481,21 @@ plot(5:1)
 }
 
 fn python_has_matplotlib() -> bool {
-    if !is_language_available(CodeLanguage::Python) {
+    let Some(python) = which_binary(CodeLanguage::Python) else {
         return false;
+    };
+    let output = std::process::Command::new(python)
+        .args([
+            "-c",
+            "import importlib.util, sys; sys.exit(42 if importlib.util.find_spec('matplotlib') is None else 0)",
+        ])
+        .output()
+        .expect("probe matplotlib with the configured Python interpreter");
+    match output.status.code() {
+        Some(0) => true,
+        Some(42) => false,
+        code => panic!("matplotlib probe failed unexpectedly with {code:?}"),
     }
-    let req = ExecutionRequest::new(CodeLanguage::Python, "import matplotlib");
-    execute(&req).map(|r| r.success).unwrap_or(false)
 }
 
 #[test]

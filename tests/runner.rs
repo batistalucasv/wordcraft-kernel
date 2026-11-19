@@ -1,12 +1,12 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::process::Stdio;
 
 use wordcraft_kernel::{
     CodeLanguage, ExecutionRequest, ExecutionResult, KernelError, PlotFormat,
-    execute as kernel_execute, is_language_available,
+    execute as kernel_execute, is_language_available, which_binary,
 };
 
 const MAX_CAPTURE_BYTES: usize = 10 * 1024 * 1024;
@@ -49,6 +49,31 @@ impl Drop for TempTestDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+fn relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
+    let from_components: Vec<_> = from.components().collect();
+    let to_components: Vec<_> = to.components().collect();
+    let common = from_components
+        .iter()
+        .zip(&to_components)
+        .take_while(|(left, right)| left == right)
+        .count();
+    if common == 0 {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for _ in &from_components[common..] {
+        relative.push("..");
+    }
+    for component in &to_components[common..] {
+        match component {
+            Component::Prefix(_) | Component::RootDir => return None,
+            _ => relative.push(component.as_os_str()),
+        }
+    }
+    Some(relative)
 }
 
 #[test]
@@ -228,7 +253,7 @@ fn forced_supervisor_termination_kills_its_process_group() {
     let helper = temp_dir.path().join("stalled-supervisor");
     fs::write(
         &helper,
-        "#!/bin/sh\nwhile :; do printf x >> child.marker; sleep 0.05; done &\nwait\n",
+        "#!/bin/sh\n(: > child.ready; sleep 6; : > child.survived) &\nwhile [ ! -f child.ready ]; do sleep 0.01; done\nsleep 9\nwait\n",
     )
     .expect("write stalled helper");
     let mut permissions = fs::metadata(&helper)
@@ -244,15 +269,39 @@ fn forced_supervisor_termination_kills_its_process_group() {
         .with_plot_capture(false);
     assert!(execute(&request).is_err());
 
-    let marker = temp_dir.path().join("child.marker");
-    let size_after_return = fs::metadata(&marker).expect("read child marker").len();
-    std::thread::sleep(std::time::Duration::from_millis(250));
-    let size_after_delay = fs::metadata(&marker)
-        .expect("read child marker after delay")
-        .len();
-    assert_eq!(
-        size_after_return, size_after_delay,
-        "child survived forced supervisor termination"
+    assert!(
+        temp_dir.path().join("child.ready").is_file(),
+        "fake supervisor did not start its descendant"
+    );
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(
+        !temp_dir.path().join("child.survived").exists(),
+        "descendant survived forced supervisor termination"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn supervisor_diagnostics_do_not_wait_for_inherited_stderr() {
+    let temp_dir = TempTestDir::create("wc-supervisor-stderr");
+    let helper = temp_dir.path().join("helper.sh");
+    fs::write(&helper, "#!/bin/sh\nsleep 3 &\nexit 0\n").expect("write helper");
+
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(&helper)
+        .expect("read helper metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&helper, permissions).expect("make helper executable");
+
+    let request = ExecutionRequest::new(CodeLanguage::Python, "")
+        .with_supervisor_path(&helper)
+        .with_plot_capture(false);
+    let started = std::time::Instant::now();
+    assert!(execute(&request).is_err());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "reading supervisor diagnostics waited for the inherited stderr handle"
     );
 }
 
@@ -313,6 +362,23 @@ fn python_path_is_used_for_module_lookup() {
     assert_eq!(result.stdout.trim(), "42");
 }
 
+#[test]
+fn python_path_supports_future_imports() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    let req = ExecutionRequest::new(
+        CodeLanguage::Python,
+        "from __future__ import annotations\nvalue: int = 42\nprint(value)",
+    )
+    .with_python_path(std::env::temp_dir());
+    let result = execute(&req).expect("execution failed");
+
+    assert!(result.success, "{}", result.stderr);
+    assert_eq!(result.stdout.trim(), "42");
+}
+
 #[cfg(unix)]
 #[test]
 fn python_path_accepts_path_separator_in_directory_name() {
@@ -339,10 +405,12 @@ fn relative_supervisor_path_is_resolved_before_changing_directory() {
         return;
     }
 
-    let helper_path = PathBuf::from(env!("CARGO_BIN_EXE_wc-kernel-supervisor"));
-    let relative_helper = helper_path
-        .strip_prefix(std::env::current_dir().expect("current directory"))
-        .expect("Cargo helper path should be under the package root");
+    let current_dir = fs::canonicalize(std::env::current_dir().expect("current directory"))
+        .expect("canonical current directory");
+    let helper_path = fs::canonicalize(env!("CARGO_BIN_EXE_wc-kernel-supervisor"))
+        .expect("canonical supervisor helper path");
+    let relative_helper =
+        relative_path(&current_dir, &helper_path).expect("helper must share the current volume");
     let working_dir = TempTestDir::create("wc-supervisor-cwd");
     let request = ExecutionRequest::new(CodeLanguage::Python, "print('ready')")
         .with_supervisor_path(relative_helper)
@@ -533,11 +601,21 @@ plot(5:1)
 }
 
 fn python_has_matplotlib() -> bool {
-    if !is_language_available(CodeLanguage::Python) {
+    let Some(python) = which_binary(CodeLanguage::Python) else {
         return false;
+    };
+    let output = Command::new(python)
+        .args([
+            "-c",
+            "import importlib.util, sys; sys.exit(42 if importlib.util.find_spec('matplotlib') is None else 0)",
+        ])
+        .output()
+        .expect("probe matplotlib with the configured Python interpreter");
+    match output.status.code() {
+        Some(0) => true,
+        Some(42) => false,
+        code => panic!("matplotlib probe failed unexpectedly with {code:?}"),
     }
-    let req = ExecutionRequest::new(CodeLanguage::Python, "import matplotlib");
-    execute(&req).map(|r| r.success).unwrap_or(false)
 }
 
 #[test]

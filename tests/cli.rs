@@ -2,6 +2,8 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 fn binary_path() -> &'static str {
     env!("CARGO_BIN_EXE_wc-kernel")
@@ -46,14 +48,22 @@ impl Drop for TestDir {
 }
 
 fn python_has_matplotlib() -> bool {
-    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+    let Some(python) = wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python)
+    else {
         return false;
-    }
-    Command::new(binary_path())
-        .args(["--lang", "py", "-e", "import matplotlib"])
+    };
+    let output = Command::new(python)
+        .args([
+            "-c",
+            "import importlib.util, sys; sys.exit(42 if importlib.util.find_spec('matplotlib') is None else 0)",
+        ])
         .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .expect("probe matplotlib with the configured Python interpreter");
+    match output.status.code() {
+        Some(0) => true,
+        Some(42) => false,
+        code => panic!("matplotlib probe failed unexpectedly with {code:?}"),
+    }
 }
 
 #[test]
@@ -169,6 +179,73 @@ fn cli_python_eval_json() {
             .as_str()
             .expect("stdout string")
             .contains("hello json")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_ctrl_c_cleans_execution_workspace_and_supervisor() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+        return;
+    }
+
+    let fixture = TestDir::new("wc-kernel-interrupt");
+    let working_dir = fixture.join("cwd");
+    let scratch_dir = fixture.join("scratch");
+    fs::create_dir(&working_dir).expect("create working directory");
+    fs::create_dir(&scratch_dir).expect("create scratch directory");
+
+    let code = "from pathlib import Path\nimport time\nPath('started').touch()\ntime.sleep(3)";
+    let mut child = Command::new(binary_path())
+        .args(["--lang", "py", "--eval", code, "--cwd"])
+        .arg(&working_dir)
+        .arg("--no-plot")
+        .env("TMPDIR", &scratch_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn wc-kernel");
+
+    let started = working_dir.join("started");
+    let startup_deadline = Instant::now() + Duration::from_secs(10);
+    while !started.is_file() {
+        if let Some(status) = child.try_wait().expect("check wc-kernel status") {
+            panic!("wc-kernel exited before starting user code: {status}");
+        }
+        assert!(
+            Instant::now() < startup_deadline,
+            "user code did not start before the deadline"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let pid = i32::try_from(child.id()).expect("wc-kernel PID fits in i32");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .expect("send SIGINT to wc-kernel");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("check wc-kernel status") {
+            break status;
+        }
+        if Instant::now() >= exit_deadline {
+            child.kill().expect("stop unresponsive wc-kernel");
+            let _ = child.wait();
+            panic!("wc-kernel did not exit after SIGINT");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    assert_eq!(status.code(), Some(130));
+    assert_eq!(
+        fs::read_dir(&scratch_dir)
+            .expect("read scratch directory")
+            .count(),
+        0,
+        "execution workspace was not cleaned up after SIGINT"
     );
 }
 

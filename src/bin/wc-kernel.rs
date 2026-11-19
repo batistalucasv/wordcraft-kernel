@@ -17,8 +17,12 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use wordcraft_kernel::{CodeLanguage, ExecutionRequest, PlotFormat, execute};
+use wordcraft_kernel::{
+    CodeLanguage, ExecutionRequest, KernelError, PlotFormat, execute_with_cancellation,
+};
 
 const USAGE: &str = "\
 wc-kernel — Command-line runner for R and Python code chunks
@@ -368,7 +372,7 @@ fn infer_language_from_path(path: &Path) -> Option<CodeLanguage> {
     }
 }
 
-fn run() -> Result<ExitCode, CliError> {
+fn run(cancelled: &AtomicBool) -> Result<ExitCode, CliError> {
     let args = std::env::args_os().skip(1);
     let maybe_cli = parse_args(args)?;
     let cli = match maybe_cli {
@@ -467,8 +471,9 @@ fn run() -> Result<ExitCode, CliError> {
         }
     }
 
-    let result = match execute(&req) {
+    let result = match execute_with_cancellation(&req, cancelled) {
         Ok(res) => res,
+        Err(KernelError::Interrupted) => return Ok(ExitCode::from(130)),
         Err(err) => {
             return Err(CliError::Runtime(err.to_string()));
         }
@@ -580,7 +585,14 @@ fn write_file_with_parent_dir(path: &Path, content: &[u8]) -> Result<(), CliErro
 }
 
 fn main() -> ExitCode {
-    match run() {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let signal_flag = Arc::clone(&cancelled);
+    if let Err(error) = ctrlc::set_handler(move || signal_flag.store(true, Ordering::Release)) {
+        eprintln!("wc-kernel: error: failed to install Ctrl-C handler: {error}");
+        return ExitCode::FAILURE;
+    }
+
+    match run(&cancelled) {
         Ok(code) => code,
         Err(CliError::Usage(msg)) => {
             eprintln!("wc-kernel: error: {msg}");
