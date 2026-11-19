@@ -1358,3 +1358,45 @@ pd.DataFrame({f"c{i}": [1] for i in range(256)}, index=["row1"])
     assert_eq!(table.rows[0].len(), 256);
     assert_eq!(table.rows[0][0], "row1");
 }
+
+#[test]
+fn r_empty_dataframe_declined_by_capture_is_printed_to_stdout() {
+    if !is_language_available(CodeLanguage::R) {
+        return;
+    }
+
+    let code = "data.frame()";
+    let req = ExecutionRequest::new(CodeLanguage::R, code);
+    let res = execute(&req).expect("execution should succeed");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert!(
+        res.tables.is_empty(),
+        "empty data frame must not be stored in tables"
+    );
+    assert!(
+        res.stdout.contains("data frame") || res.stdout.contains("0"),
+        "declined empty data frame must be printed to stdout: {}",
+        res.stdout
+    );
+}
+
+#[test]
+fn r_tables_beyond_capacity_are_printed_to_stdout() {
+    if !is_language_available(CodeLanguage::R) {
+        return;
+    }
+
+    let mut code = String::new();
+    for i in 1..=17 {
+        code.push_str(&format!("data.frame(tbl_id = {i})\n"));
+    }
+    let req = ExecutionRequest::new(CodeLanguage::R, &code);
+    let res = execute(&req).expect("execution should succeed");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert_eq!(res.tables.len(), 16, "exactly 16 tables should be captured");
+    assert!(
+        res.stdout.contains("tbl_id") && res.stdout.contains("17"),
+        "the 17th declined table must be printed to stdout: {}",
+        res.stdout
+    );
+}

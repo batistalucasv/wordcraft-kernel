@@ -833,10 +833,10 @@ local({
 
   capture <- function(value) {
     if (length(driver$tables) >= 16L) {
-      return(invisible(NULL))
+      return(invisible(FALSE))
     }
     if (!is.data.frame(value) && !is.matrix(value)) {
-      return(invisible(NULL))
+      return(invisible(FALSE))
     }
     count <- min(nrow(value), 10000L)
 
@@ -864,7 +864,7 @@ local({
     max_cols <- if (has_labels) 255L else 256L
     cols_count <- min(ncol(value), max_cols)
     if (cols_count == 0L && !has_labels) {
-      return(invisible(NULL))
+      return(invisible(FALSE))
     }
 
     raw_headers <- if (is.matrix(value)) colnames(value) else names(value)
@@ -899,7 +899,7 @@ local({
       rows[[index]] <- cells
     }
     driver$tables[[length(driver$tables) + 1L]] <- list(headers = as.list(headers), rows = rows)
-    invisible(NULL)
+    invisible(TRUE)
   }
 
   write_tables <- function() {
@@ -971,9 +971,8 @@ __PLOT_SETUP__
       result <- base::withVisible(base::eval(expr, envir = globalenv()))
       base::assign(".Last.value", result$value, envir = base::.GlobalEnv)
       if (isTRUE(result$visible)) {
-        if (is.data.frame(result$value) || is.matrix(result$value)) {
-          capture(result$value)
-        } else {
+        if (!((is.data.frame(result$value) || is.matrix(result$value)) &&
+              isTRUE(capture(result$value)))) {
           print(result$value)
         }
       }
