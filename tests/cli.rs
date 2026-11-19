@@ -379,6 +379,31 @@ fn cli_export_error_still_emits_json() {
 }
 
 #[test]
+fn cli_reports_truncated_output_in_json() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+        eprintln!("Skipping Python test: python3 not found");
+        return;
+    }
+
+    let output = Command::new(binary_path())
+        .args([
+            "--lang",
+            "py",
+            "-e",
+            "import sys; sys.stdout.write('x' * (12 * 1024 * 1024))",
+            "--json",
+            "--no-plot",
+        ])
+        .output()
+        .expect("failed to execute wc-kernel");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON result");
+    assert_eq!(json["output_truncated"], true);
+    assert!(json["stdout"].as_str().expect("stdout string").len() <= 10 * 1024 * 1024);
+}
+
+#[test]
 fn cli_timeout_enforced() {
     if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
         eprintln!("Skipping Python test: python3 not found");

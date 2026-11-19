@@ -102,6 +102,7 @@ fn python_basic_execution() {
     assert_eq!(result.exit_code, Some(0));
     assert!(result.stdout.contains("Hello from Python!"));
     assert!(!result.timed_out);
+    assert!(!result.output_truncated);
     assert!(result.plot_png.is_none());
     assert!(result.plot_svg.is_none());
 }
@@ -179,6 +180,20 @@ fn python_timeout_preserves_partial_stdout() {
 
     assert!(result.timed_out);
     assert!(result.stdout.contains("before timeout"));
+}
+
+#[test]
+fn python_output_budget_limits_capture() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    let code = "import sys\nsys.stdout.write('x' * (12 * 1024 * 1024))\nsys.stdout.flush()";
+    let req = ExecutionRequest::new(CodeLanguage::Python, code).with_plot_capture(false);
+    let result = execute(&req).expect("execution failed");
+
+    assert!(result.output_truncated);
+    assert!(result.stdout.len() as u64 <= MAX_CAPTURE_BYTES);
 }
 
 #[test]
