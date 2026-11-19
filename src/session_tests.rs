@@ -868,6 +868,46 @@ fig.canvas.mpl_connect("draw_event", on_draw)
 }
 
 #[test]
+fn python_plot_capture_keeps_request_paths_for_draw_callbacks() {
+    if !python_has_matplotlib() {
+        return;
+    }
+    let Some(mut manager) = manager_for(CodeLanguage::Python) else {
+        return;
+    };
+
+    let fixture = TempDirGuard::new("wc-py-draw-path");
+    let marker = fixture.path().join("draw.marker");
+    let helper = format!(
+        "def write_marker():\n    open({}, 'w').write('ok')\n",
+        serde_json::to_string(&marker.to_string_lossy()).expect("encode marker path")
+    );
+    fs::write(fixture.path().join("wc_draw_path_helper.py"), helper).expect("write draw helper");
+
+    let code = r#"
+import matplotlib.pyplot as plt
+fig, ax = plt.subplots()
+ax.plot([1, 2], [3, 4])
+def on_draw(event):
+    import wc_draw_path_helper
+    wc_draw_path_helper.write_marker()
+fig.canvas.mpl_connect("draw_event", on_draw)
+"#;
+    let req = ExecutionRequest::new(CodeLanguage::Python, code)
+        .with_python_path(fixture.path())
+        .with_plot_capture(true)
+        .with_plot_format(PlotFormat::Png)
+        .with_timeout(10_000);
+    let result = manager.execute("py-draw-path", &req).expect("execute plot");
+
+    assert!(result.success, "stderr: {}", result.stderr);
+    assert!(result.plot_png.is_some(), "plot should be captured");
+    assert!(marker.is_file(), "the draw callback must import a module from the request path");
+
+    manager.close_session("py-draw-path");
+}
+
+#[test]
 fn r_driver_resilient_to_function_shadowing_and_env_wiping() {
     let Some(mut manager) = manager_for(CodeLanguage::R) else {
         return;

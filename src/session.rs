@@ -1892,34 +1892,27 @@ def main():
         before_figures = {}
         drawn_figures = set()
         draw_restorers = []
+        requested_paths = []
+        original_positions = {}
 
         try:
             if cwd:
                 os.chdir(cwd)
-            requested_paths = []
             for path in python_paths:
                 if path not in requested_paths:
                     requested_paths.append(path)
-            original_positions = {}
             for path in requested_paths:
                 if path in sys.path:
                     original_positions[path] = sys.path.index(path)
-            try:
-                for path in reversed(requested_paths):
-                    while path in sys.path:
-                        sys.path.remove(path)
-                    sys.path.insert(0, path)
-                if requested_paths:
-                    refresh_matplotlib()
-                before_figures = snapshot_figures()
-                drawn_figures, draw_restorers = track_figure_draws()
-                exec(compile(code + "\n", "<wordcraft-chunk>", "exec"), NAMESPACE)
-            finally:
-                for path in requested_paths:
-                    while path in sys.path:
-                        sys.path.remove(path)
-                for path, index in original_positions.items():
-                    sys.path.insert(min(index, len(sys.path)), path)
+            for path in reversed(requested_paths):
+                while path in sys.path:
+                    sys.path.remove(path)
+                sys.path.insert(0, path)
+            if requested_paths:
+                refresh_matplotlib()
+            before_figures = snapshot_figures()
+            drawn_figures, draw_restorers = track_figure_draws()
+            exec(compile(code + "\n", "<wordcraft-chunk>", "exec"), NAMESPACE)
         except SystemExit as exc:
             status = "error"
             try:
@@ -1933,9 +1926,18 @@ def main():
             except Exception:
                 pass
         finally:
-            restore_figure_draws(draw_restorers)
-            if capture:
-                capture_plots(seq, fmt, before_figures, drawn_figures)
+            # Capture runs while the request paths are still installed, because
+            # savefig can fire draw_event callbacks that import user modules.
+            try:
+                restore_figure_draws(draw_restorers)
+                if capture:
+                    capture_plots(seq, fmt, before_figures, drawn_figures)
+            finally:
+                for path in requested_paths:
+                    while path in sys.path:
+                        sys.path.remove(path)
+                for path, index in original_positions.items():
+                    sys.path.insert(min(index, len(sys.path)), path)
             try:
                 DIAG_STDERR.flush()
             except Exception:
