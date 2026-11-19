@@ -40,6 +40,18 @@ fn r_has_png_device() -> bool {
     execute(&req).map(|res| res.success).unwrap_or(false)
 }
 
+fn r_has_svg_device() -> bool {
+    if !is_language_available(CodeLanguage::R) {
+        return false;
+    }
+    let req = ExecutionRequest::new(
+        CodeLanguage::R,
+        "tf <- tempfile(fileext = '.svg'); grDevices::svg(tf); grDevices::dev.off(); unlink(tf)",
+    )
+    .with_timeout(5_000);
+    execute(&req).map(|res| res.success).unwrap_or(false)
+}
+
 #[test]
 fn python_session_keeps_variables_between_executions() {
     let Some(mut manager) = manager_for(CodeLanguage::Python) else {
@@ -253,13 +265,26 @@ fn session_timeout_kills_the_daemon() {
         return;
     };
 
-    let hang = ExecutionRequest::new(CodeLanguage::Python, "import time\ntime.sleep(10)")
-        .with_timeout(300);
+    let warm = ExecutionRequest::new(CodeLanguage::Python, "print('warm')");
+    let res_warm = manager.execute("py-timeout", &warm).expect("warm");
+    assert!(res_warm.success);
+    assert_eq!(res_warm.stdout.trim(), "warm");
+
+    let hang = ExecutionRequest::new(
+        CodeLanguage::Python,
+        "import sys, time\nsys.stdout.write('started\\n')\nsys.stdout.flush()\ntime.sleep(10)",
+    )
+    .with_timeout(300);
     let result = manager
         .execute("py-timeout", &hang)
         .expect("execution result");
     assert!(result.timed_out);
     assert!(!result.success);
+    assert!(
+        result.stdout.contains("started"),
+        "stdout should capture output before timeout: {:?}",
+        result.stdout
+    );
     assert!(!manager.contains("py-timeout"));
 
     let next = chunk(CodeLanguage::Python, "print('recovered')");
@@ -697,7 +722,7 @@ fn r_session_captures_a_plot() {
 
 #[test]
 fn r_dual_plot_captures_both_png_and_svg_and_closes_devices() {
-    if !r_has_png_device() {
+    if !r_has_png_device() || !r_has_svg_device() {
         return;
     }
     let Some(mut manager) = manager_for(CodeLanguage::R) else {
@@ -899,6 +924,9 @@ fn r_user_closing_plot_device_and_opening_pdf_is_handled_safely() {
     let Some(mut manager) = manager_for(CodeLanguage::R) else {
         return;
     };
+    if !r_has_png_device() {
+        return;
+    }
 
     let code = r#"
 plot(1:5)
@@ -910,6 +938,10 @@ plot(5:1)
     let req = ExecutionRequest::new(CodeLanguage::R, code).with_plot_capture(true);
     let res = manager.execute("r-devoff-pdf", &req).expect("exec");
     assert!(res.success, "stderr: {}", res.stderr);
+    assert!(
+        res.plot_png.is_some(),
+        "first chunk must exercise driver's PNG capture device"
+    );
 
     // Follow-up chunk verifies the replacement device was kept open and intact
     let check_code = r#"
@@ -965,7 +997,7 @@ fn session_rejects_non_utf8_working_directory_gracefully() {
 
     let res = manager.execute("py-utf8", &req);
     assert!(res.is_err());
-    let err_str = res.err().unwrap().to_string();
+    let err_str = res.expect_err("should reject").to_string();
     assert!(
         err_str.contains("valid UTF-8"),
         "error should state valid UTF-8 requirement: {}",
@@ -997,4 +1029,277 @@ fn r_session_recovers_after_close_all_connections() {
     );
 
     manager.close_session("r-close-all");
+}
+
+#[test]
+fn session_manager_enforces_max_sessions_limit() {
+    let Some(mut manager) = manager_for(CodeLanguage::Python) else {
+        return;
+    };
+    manager.set_max_sessions(2);
+
+    let req1 = chunk(CodeLanguage::Python, "x = 10");
+    assert!(manager.execute("s1", &req1).expect("s1").success);
+
+    let req2 = chunk(CodeLanguage::Python, "y = 20");
+    assert!(manager.execute("s2", &req2).expect("s2").success);
+
+    // Third new session should be rejected because limit of 2 is reached
+    let req3 = chunk(CodeLanguage::Python, "z = 30");
+    let err = manager.execute("s3", &req3).expect_err("should reject s3");
+    match err {
+        KernelError::SessionCapacityExceeded { max_sessions } => {
+            assert_eq!(max_sessions, 2);
+        }
+        other => panic!("expected SessionCapacityExceeded, got {other:?}"),
+    }
+
+    // Existing session s1 can still be executed without creating a new session
+    let req1_check = chunk(CodeLanguage::Python, "print(x)");
+    let res1 = manager.execute("s1", &req1_check).expect("s1 check");
+    assert_eq!(res1.stdout.trim(), "10");
+
+    manager.close_session("s1");
+    manager.close_session("s2");
+}
+
+#[test]
+fn large_output_sets_truncated_flag_and_bounds_memory() {
+    let Some(mut manager) = manager_for(CodeLanguage::Python) else {
+        return;
+    };
+
+    // Print > 10 MiB of text
+    let req = ExecutionRequest::new(
+        CodeLanguage::Python,
+        "import sys\nsys.stdout.write('X' * (11 * 1024 * 1024))\nsys.stdout.flush()",
+    );
+    let res = manager.execute("large-out", &req).expect("large out");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert!(res.output_truncated, "expected output_truncated to be true");
+    assert!(
+        res.stdout.len() <= crate::session::MAX_STREAM_BYTES,
+        "stdout size {} should be <= MAX_STREAM_BYTES {}",
+        res.stdout.len(),
+        crate::session::MAX_STREAM_BYTES
+    );
+
+    // Follow-up execution should work cleanly
+    let req2 = chunk(CodeLanguage::Python, "print('clean')");
+    let res2 = manager.execute("large-out", &req2).expect("clean");
+    assert!(res2.success);
+    assert_eq!(res2.stdout.trim(), "clean");
+
+    manager.close_session("large-out");
+}
+
+#[test]
+fn python_stable_stream_supports_buffer_and_fileno() {
+    let Some(mut manager) = manager_for(CodeLanguage::Python) else {
+        return;
+    };
+
+    let code = r#"
+import sys, subprocess
+sys.stdout.buffer.write(b"binary stdout\n")
+sys.stderr.buffer.write(b"binary stderr\n")
+assert sys.stdout.fileno() == 1
+assert sys.stderr.fileno() == 2
+subprocess.run([sys.executable, "-c", "import sys; sys.stdout.write('from subprocess\\n')"], stdout=sys.stdout)
+"#;
+    let res = manager
+        .execute("py-stream-apis", &chunk(CodeLanguage::Python, code))
+        .expect("exec");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert!(res.stdout.contains("binary stdout"));
+    assert!(res.stdout.contains("from subprocess"));
+    assert!(res.stderr.contains("binary stderr"));
+
+    manager.close_session("py-stream-apis");
+}
+
+#[test]
+fn python_capture_disabled_chunk_does_not_leak_stale_plot() {
+    let Some(mut manager) = manager_for(CodeLanguage::Python) else {
+        return;
+    };
+    if !python_has_matplotlib() {
+        return;
+    }
+
+    // Chunk 1: draw plot with capture disabled
+    let req1 = ExecutionRequest::new(
+        CodeLanguage::Python,
+        "import matplotlib.pyplot as plt\nplt.plot([1, 2, 3])",
+    )
+    .with_plot_capture(false);
+    let res1 = manager.execute("py-stale-fig", &req1).expect("chunk 1");
+    assert!(res1.success);
+    assert!(res1.plot_png.is_none(), "chunk 1 had capture disabled");
+
+    // Chunk 2: print text with capture enabled (should NOT emit chunk 1's figure)
+    let req2 =
+        ExecutionRequest::new(CodeLanguage::Python, "print('just text')").with_plot_capture(true);
+    let res2 = manager.execute("py-stale-fig", &req2).expect("chunk 2");
+    assert!(res2.success);
+    assert_eq!(res2.stdout.trim(), "just text");
+    assert!(
+        res2.plot_png.is_none(),
+        "chunk 2 only printed text and should not re-emit chunk 1 figure"
+    );
+
+    // Chunk 3: genuine edit to existing figure with capture enabled
+    let req3 = ExecutionRequest::new(
+        CodeLanguage::Python,
+        "plt.title('Updated Title')\nplt.plot([4, 5, 6])",
+    )
+    .with_plot_capture(true);
+    let res3 = manager.execute("py-stale-fig", &req3).expect("chunk 3");
+    assert!(res3.success);
+    assert!(
+        res3.plot_png.is_some(),
+        "chunk 3 genuinely edited figure and must be captured"
+    );
+
+    manager.close_session("py-stale-fig");
+}
+
+#[test]
+fn python_session_handles_overwritten_sys_stderr_during_error() {
+    let Some(mut manager) = manager_for(CodeLanguage::Python) else {
+        return;
+    };
+
+    let req1 = chunk(
+        CodeLanguage::Python,
+        "import sys\nx = 42\nsys.stderr = None\nraise RuntimeError('stderr was None')",
+    );
+    let res1 = manager
+        .execute("py-bad-stderr", &req1)
+        .expect("exec bad stderr");
+    assert!(!res1.success);
+    assert!(res1.stderr.contains("stderr was None"));
+
+    // Session survived and retains state
+    let req2 = chunk(CodeLanguage::Python, "print('x is', x)");
+    let res2 = manager
+        .execute("py-bad-stderr", &req2)
+        .expect("exec recovered");
+    assert!(res2.success);
+    assert_eq!(res2.stdout.trim(), "x is 42");
+
+    manager.close_session("py-bad-stderr");
+}
+
+#[cfg(unix)]
+#[test]
+fn r_session_system2_cat_does_not_hang() {
+    let Some(mut manager) = manager_for(CodeLanguage::R) else {
+        return;
+    };
+
+    // system2 with default stdin gets EOF immediately
+    let req1 = chunk(
+        CodeLanguage::R,
+        "res <- system2('cat', stdout = TRUE)\ncat('length:', length(res), '\n')",
+    );
+    let res1 = manager.execute("r-system2", &req1).expect("system2 cat");
+    assert!(res1.success, "stderr: {}", res1.stderr);
+    assert!(res1.stdout.contains("length: 0"));
+
+    // system2 with explicit input works
+    let req2 = chunk(
+        CodeLanguage::R,
+        "res <- system2('cat', input = 'hello-system2', stdout = TRUE)\ncat(res, '\n')",
+    );
+    let res2 = manager
+        .execute("r-system2", &req2)
+        .expect("system2 cat with input");
+    assert!(res2.success, "stderr: {}", res2.stderr);
+    assert!(res2.stdout.contains("hello-system2"));
+
+    manager.close_session("r-system2");
+}
+
+#[test]
+fn r_session_dispatches_s3_print_from_globalenv() {
+    let Some(mut manager) = manager_for(CodeLanguage::R) else {
+        return;
+    };
+
+    let req1 = chunk(
+        CodeLanguage::R,
+        "print.custom_type <- function(x, ...) cat('CUSTOM S3 PRINT METHOD\\n')\nx <- structure(list(), class = 'custom_type')",
+    );
+    let res1 = manager.execute("r-s3", &req1).expect("define s3 method");
+    assert!(res1.success);
+
+    // Visible expression of class custom_type should invoke print.custom_type
+    let req2 = chunk(CodeLanguage::R, "x");
+    let res2 = manager.execute("r-s3", &req2).expect("print s3 object");
+    assert!(res2.success);
+    assert!(
+        res2.stdout.contains("CUSTOM S3 PRINT METHOD"),
+        "stdout was: {:?}",
+        res2.stdout
+    );
+
+    manager.close_session("r-s3");
+}
+
+#[test]
+fn r_session_reports_error_even_after_close_all_connections() {
+    let Some(mut manager) = manager_for(CodeLanguage::R) else {
+        return;
+    };
+
+    let req1 = chunk(
+        CodeLanguage::R,
+        "val <- 99\ncloseAllConnections()\nstop('boom after close connections')",
+    );
+    let res1 = manager
+        .execute("r-close-conn-err", &req1)
+        .expect("exec error");
+    assert!(!res1.success);
+    assert!(res1.stderr.contains("boom after close connections"));
+
+    // Session remains intact and state was preserved
+    let req2 = chunk(CodeLanguage::R, "cat('val:', val, '\n')");
+    let res2 = manager
+        .execute("r-close-conn-err", &req2)
+        .expect("exec next");
+    assert!(res2.success);
+    assert_eq!(res2.stdout.trim(), "val: 99");
+
+    manager.close_session("r-close-conn-err");
+}
+
+#[test]
+fn r_session_symbol_print_does_not_fail() {
+    let Some(mut manager) = manager_for(CodeLanguage::R) else {
+        return;
+    };
+
+    let req = chunk(CodeLanguage::R, "quote(not_defined)");
+    let res = manager.execute("r-symbol", &req).expect("exec symbol");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert!(res.stdout.contains("not_defined"));
+
+    manager.close_session("r-symbol");
+}
+
+#[test]
+fn session_unrepresentable_timeout_is_rejected() {
+    let timeout = Duration::from_millis(u64::MAX);
+    if Instant::now().checked_add(timeout).is_none() {
+        let Some(mut manager) = manager_for(CodeLanguage::Python) else {
+            return;
+        };
+
+        let req = ExecutionRequest::new(CodeLanguage::Python, "x = 1").with_timeout(u64::MAX);
+        let err = manager
+            .execute("py-unrep", &req)
+            .expect_err("should reject overflow");
+        assert!(matches!(err, KernelError::SessionProtocol(_)));
+    }
 }

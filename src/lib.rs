@@ -13,7 +13,7 @@ pub mod templates;
 
 mod session;
 
-pub use session::{DEFAULT_IDLE_TIMEOUT, SessionInfo, SessionManager};
+pub use session::{DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_SESSIONS, SessionInfo, SessionManager};
 
 use std::fmt;
 use std::fs;
@@ -258,13 +258,16 @@ pub struct ExecutionResult {
     pub stdout: String,
     /// Captured standard error.
     pub stderr: String,
-    /// Process exit code, or None if terminated by signal/timeout.
+    /// Process or chunk exit code (`Some(0)` on success). For one-shot [`execute`], this reflects the OS
+    /// process status; for persistent sessions ([`SessionManager`]), it indicates the status of the evaluated chunk
+    /// without ending the long-running daemon interpreter.
     pub exit_code: Option<i32>,
-    /// Whether the process exited cleanly with code 0.
+    /// Whether the execution completed cleanly. For persistent sessions, a failed chunk returns `false`
+    /// without terminating the interpreter session.
     pub success: bool,
     /// True if execution was halted due to timeout limit.
     pub timed_out: bool,
-    /// True if stdout or stderr exceeded the capture limit and was truncated.
+    /// True if standard output, standard error, or captured plot artifacts were truncated due to size limits.
     #[serde(default)]
     pub output_truncated: bool,
     /// PNG bytes of plot/chart if generated and captured.
@@ -320,6 +323,9 @@ pub enum KernelError {
 
     #[error("Session protocol error: {0}")]
     SessionProtocol(String),
+
+    #[error("Session capacity exceeded: maximum of {max_sessions} active sessions reached")]
+    SessionCapacityExceeded { max_sessions: usize },
 }
 
 /// Check if the interpreter for a given language is available on the host system.

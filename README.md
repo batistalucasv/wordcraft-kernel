@@ -17,7 +17,7 @@ Developed specifically for research in **Ecology**, statistical data science, an
   - Configurable via `PlotFormat::Png`, `PlotFormat::Svg`, and `PlotFormat::Both`.
   - `with_prefer_svg(true)` upgrades the default PNG capture to SVG; an explicit `PlotFormat::Both` is preserved.
 - **Clean Output Streams:** Strict separation of standard output (`stdout`), standard error (`stderr`), exit codes, and elapsed execution time.
-- **Persistent Sessions:** A `SessionManager` keeps one background R or Python daemon per `session_id`, so datasets loaded by one chunk stay in memory for the next chunk. Sessions can be restarted, closed, and expire automatically when idle.
+- **Persistent Sessions:** A `SessionManager` keeps one background R or Python daemon per `session_id`, so datasets loaded by one chunk stay in memory for the next chunk. Sessions can be restarted, closed, and expire automatically when idle. Note: structured tabular data capture (`ExecutionResult::tables`) is supported in one-shot `execute()`; persistent sessions return `tables` as empty.
 - **Template Library:** Ready-to-run, commented ecology and statistics snippets for R and Python, described in `templates`.
 - **Standalone CLI (`wc-kernel`):** Command-line binary for direct terminal execution, inspection, piped scripts, and JSON integration with external tools.
 
@@ -288,10 +288,14 @@ Rules that apply to session code:
 - The daemon keeps its global environment, imports and working directory between
   chunks. A failed chunk leaves the session alive, and later chunks can inspect
   whatever the failed chunk had already assigned.
-- Chunks must not read standard input: stdin carries length-prefixed IPC protocol payloads.
-  The Python driver isolates `sys.stdin` with an empty stream while a chunk runs.
-- Subprocess output from user code is redirected to chunk output files, isolating the
-  protocol stream from spawned child processes.
+- Chunks must not read standard input: Python chunks receive an empty stdin stream
+  while the driver reserves stdin for IPC, whereas R chunks receive null stdin and
+  requests arrive over an authenticated loopback socket.
+- Tabular data capture (`ExecutionResult::tables`) is supported in one-shot `execute()`;
+  persistent sessions return `tables` as empty.
+- Subprocess output from Python user code is redirected to chunk output files, isolating the
+  protocol stream from spawned child processes. In R, subprocesses inherit null stdin and
+  standard descriptors redirected to chunk output files.
 - A chunk that exceeds `timeout_ms` terminates the daemon process tree; the call returns
   `timed_out` and the next call for that id starts a fresh interpreter.
 - Session ids belong to one language. Reusing an id with another language

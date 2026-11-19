@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
@@ -45,6 +45,15 @@ static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Default time an unused session is kept alive before it is reaped.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Default maximum number of concurrent active interpreter sessions.
+pub const DEFAULT_MAX_SESSIONS: usize = 16;
+
+/// Maximum bytes kept from each captured output stream (stdout and stderr) per chunk.
+pub const MAX_STREAM_BYTES: usize = 10 * 1024 * 1024;
+
+/// Maximum bytes kept from each captured plot artifact (PNG and SVG) per chunk.
+pub const MAX_PLOT_BYTES: usize = 20 * 1024 * 1024;
 
 /// Snapshot of one live session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +75,9 @@ pub struct SessionInfo {
 /// so variables, functions, imports and the working directory persist. Sessions
 /// of different languages never share an id.
 ///
+/// Structured tabular data capture ([`ExecutionResult::tables`]) is supported in
+/// one-shot [`execute`](crate::execute); persistent sessions return `tables` as empty.
+///
 /// Idle sessions are reaped lazily: every call to [`execute`](Self::execute)
 /// first drops sessions whose last use is older than
 /// [`idle_timeout`](Self::idle_timeout), and hosts can call
@@ -74,6 +86,7 @@ pub struct SessionInfo {
 pub struct SessionManager {
     sessions: HashMap<String, Session>,
     idle_timeout: Duration,
+    max_sessions: usize,
 }
 
 impl Default for SessionManager {
@@ -83,11 +96,12 @@ impl Default for SessionManager {
 }
 
 impl SessionManager {
-    /// Create a manager with [`DEFAULT_IDLE_TIMEOUT`] and no sessions.
+    /// Create a manager with [`DEFAULT_IDLE_TIMEOUT`], [`DEFAULT_MAX_SESSIONS`], and no sessions.
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            max_sessions: DEFAULT_MAX_SESSIONS,
         }
     }
 
@@ -98,14 +112,30 @@ impl SessionManager {
         self
     }
 
+    /// Set the maximum number of concurrent active sessions allowed.
+    pub fn with_max_sessions(mut self, max: usize) -> Self {
+        self.max_sessions = max;
+        self
+    }
+
     /// Current idle timeout.
     pub fn idle_timeout(&self) -> Duration {
         self.idle_timeout
     }
 
+    /// Current maximum active sessions.
+    pub fn max_sessions(&self) -> usize {
+        self.max_sessions
+    }
+
     /// Change the idle timeout of an existing manager.
     pub fn set_idle_timeout(&mut self, timeout: Duration) {
         self.idle_timeout = timeout;
+    }
+
+    /// Change the maximum active sessions of an existing manager.
+    pub fn set_max_sessions(&mut self, max: usize) {
+        self.max_sessions = max;
     }
 
     /// Run a chunk in the session called `session_id`, creating the daemon on
@@ -119,8 +149,16 @@ impl SessionManager {
         session_id: &str,
         request: &ExecutionRequest,
     ) -> Result<ExecutionResult, KernelError> {
+        let timeout = Duration::from_millis(request.timeout_ms);
+        if Instant::now().checked_add(timeout).is_none() {
+            return Err(KernelError::SessionProtocol(
+                "timeout exceeds maximum representable duration".to_string(),
+            ));
+        }
+
         // 1. Run idle reaping first so expired sessions are cleaned up even if request validation fails later.
         self.reap_idle_sessions();
+        self.sessions.retain(|_, s| s.is_alive());
 
         // 2. Pre-execution validation: reject invalid requests before altering session state.
         let resolved_cwd = match request.working_dir.as_ref() {
@@ -177,6 +215,11 @@ impl SessionManager {
         };
 
         if needs_spawn {
+            if self.sessions.len() >= self.max_sessions && !self.sessions.contains_key(session_id) {
+                return Err(KernelError::SessionCapacityExceeded {
+                    max_sessions: self.max_sessions,
+                });
+            }
             self.sessions.remove(session_id);
             let session = Session::spawn(session_id, request.language)?;
             self.sessions.insert(session_id.to_string(), session);
@@ -308,11 +351,33 @@ impl SessionManager {
     }
 }
 
+enum SessionInput {
+    Pipe(ChildStdin),
+    Socket(std::net::TcpStream),
+}
+
+impl Write for SessionInput {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Pipe(p) => p.write(buf),
+            Self::Socket(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Pipe(p) => p.flush(),
+            Self::Socket(s) => s.flush(),
+        }
+    }
+}
+
 struct Session {
     id: String,
     language: CodeLanguage,
     child: Mutex<Child>,
-    stdin: Option<ChildStdin>,
+    pgid: Mutex<Option<u32>>,
+    input: Option<SessionInput>,
     lines: Receiver<Option<String>>,
     temp_dir: PathBuf,
     last_used: Instant,
@@ -328,6 +393,55 @@ impl std::fmt::Debug for Session {
             .field("seq", &self.seq)
             .finish_non_exhaustive()
     }
+}
+
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        if let Some(child) = self.0.as_mut() {
+            child.try_wait()
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn into_child(mut self) -> Option<Child> {
+        self.0.take()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn generate_auth_token() -> String {
+    #[cfg(unix)]
+    {
+        if let Ok(mut f) = fs::File::open("/dev/urandom") {
+            let mut buf = [0u8; 16];
+            if f.read_exact(&mut buf).is_ok() {
+                return buf.iter().map(|b| format!("{b:02x}")).collect();
+            }
+        }
+    }
+    format!(
+        "{:016x}{:016x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 impl Session {
@@ -427,43 +541,145 @@ impl Session {
             .map_err(|e| KernelError::Io(format!("create {}: {e}", stderr_path.display())))?;
 
         let mut command = Command::new(binary);
-        if language == CodeLanguage::Python {
-            command.arg("-u");
-        }
-        command
-            .arg(&driver_path)
-            .arg(temp_dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(stderr_file))
-            .current_dir(temp_dir)
-            .env("TMPDIR", temp_dir)
-            .env("TEMP", temp_dir)
-            .env("TMP", temp_dir);
+        let (mut child, input) = match language {
+            CodeLanguage::Python => {
+                command.arg("-u");
+                command
+                    .arg(&driver_path)
+                    .arg(temp_dir)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::from(stderr_file))
+                    .current_dir(temp_dir)
+                    .env("TMPDIR", temp_dir)
+                    .env("TEMP", temp_dir)
+                    .env("TMP", temp_dir);
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    command.process_group(0);
+                }
 
-        let mut child = command
-            .spawn()
-            .map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?;
+                let mut child = command
+                    .spawn()
+                    .map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?;
 
-        let stdin = child.stdin.take().ok_or_else(|| {
-            KernelError::SessionProtocol("interpreter stdin pipe was not created".to_string())
-        })?;
+                let stdin = child.stdin.take().ok_or_else(|| {
+                    KernelError::SessionProtocol(
+                        "interpreter stdin pipe was not created".to_string(),
+                    )
+                })?;
+                (child, Some(SessionInput::Pipe(stdin)))
+            }
+            CodeLanguage::R => {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                    .map_err(|e| KernelError::Io(format!("bind R session socket: {e}")))?;
+                let port = listener
+                    .local_addr()
+                    .map_err(|e| KernelError::Io(format!("local_addr for R session: {e}")))?
+                    .port();
+
+                let auth_token = generate_auth_token();
+                let auth_path = temp_dir.join("auth.txt");
+                let _ = fs::write(&auth_path, &auth_token);
+
+                command
+                    .arg(&driver_path)
+                    .arg(temp_dir)
+                    .arg(port.to_string())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::from(stderr_file))
+                    .current_dir(temp_dir)
+                    .env("TMPDIR", temp_dir)
+                    .env("TEMP", temp_dir)
+                    .env("TMP", temp_dir)
+                    .env("WORDCRAFT_AUTH_TOKEN", &auth_token);
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    command.process_group(0);
+                }
+
+                let child = command
+                    .spawn()
+                    .map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?;
+
+                let mut child_guard = ChildGuard::new(child);
+
+                listener
+                    .set_nonblocking(true)
+                    .map_err(|e| KernelError::Io(format!("set nonblocking on R listener: {e}")))?;
+                let start = Instant::now();
+                let expected_auth = format!("AUTH {auth_token}");
+
+                let stream = loop {
+                    let elapsed = start.elapsed();
+                    if elapsed > Duration::from_secs(15) {
+                        return Err(KernelError::SessionTerminated {
+                            session_id: session_id.to_string(),
+                            detail: "timeout waiting for R driver to connect".to_string(),
+                        });
+                    }
+                    let remaining = Duration::from_secs(15).saturating_sub(elapsed);
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream.set_nonblocking(false).map_err(|e| {
+                                KernelError::Io(format!("set blocking on R socket: {e}"))
+                            })?;
+                            let read_timeout = remaining.min(Duration::from_secs(5));
+                            let _ = stream.set_read_timeout(Some(read_timeout));
+                            let mut auth_reader = BufReader::new(&mut stream);
+                            let mut auth_line = String::new();
+                            let mut take_auth = (&mut auth_reader).take(256);
+                            let auth_ok = take_auth.read_line(&mut auth_line).is_ok()
+                                && auth_line.trim() == expected_auth;
+                            let _ = stream.set_read_timeout(None);
+                            if auth_ok {
+                                break stream;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if let Ok(Some(_)) = child_guard.try_wait() {
+                                return Err(KernelError::SessionTerminated {
+                                    session_id: session_id.to_string(),
+                                    detail:
+                                        "R interpreter exited before connecting to driver socket"
+                                            .to_string(),
+                                });
+                            }
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        Err(e) => {
+                            return Err(KernelError::Io(format!(
+                                "accept connection from R driver: {e}"
+                            )));
+                        }
+                    }
+                };
+                let child = child_guard.into_child().ok_or_else(|| {
+                    KernelError::SessionProtocol(
+                        "child process was dropped unexpectedly".to_string(),
+                    )
+                })?;
+                (child, Some(SessionInput::Socket(stream)))
+            }
+        };
+
+        let pgid = Mutex::new(Some(child.id()));
         let stdout: ChildStdout = child.stdout.take().ok_or_else(|| {
             KernelError::SessionProtocol("interpreter stdout pipe was not created".to_string())
         })?;
 
-        let (sender, lines) = mpsc::channel();
+        let (sender, lines) = mpsc::sync_channel(256);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
                 let mut line = String::new();
-                match reader.read_line(&mut line) {
+                let mut take = (&mut reader).take(65_536);
+                match take.read_line(&mut line) {
                     Ok(0) | Err(_) => {
                         let _ = sender.send(None);
                         break;
@@ -481,7 +697,8 @@ impl Session {
             id: session_id.to_string(),
             language,
             child: Mutex::new(child),
-            stdin: Some(stdin),
+            pgid,
+            input,
             lines,
             temp_dir: temp_dir.to_path_buf(),
             last_used: Instant::now(),
@@ -498,7 +715,14 @@ impl Session {
         let seq = self.seq;
         let started = Instant::now();
         let timeout = Duration::from_millis(request.timeout_ms);
-        let deadline = started + timeout;
+        let deadline = match started.checked_add(timeout) {
+            Some(d) => d,
+            None => {
+                return Err(KernelError::SessionProtocol(
+                    "timeout exceeds maximum representable duration".to_string(),
+                ));
+            }
+        };
         let format = plot_format_token(request);
 
         let cwd_str = match resolved_cwd {
@@ -516,7 +740,7 @@ impl Session {
         let session_id = self.id.clone();
         let files = ChunkFiles::new(&self.temp_dir, seq);
 
-        let mut stdin_pipe = match self.stdin.take() {
+        let mut input_pipe = match self.input.take() {
             Some(pipe) => pipe,
             None => {
                 return Err(KernelError::SessionTerminated {
@@ -528,24 +752,30 @@ impl Session {
 
         let (send_tx, send_rx) = mpsc::channel();
         let code = request.code.clone();
+        let cwd_string = cwd_str.to_string();
+        let format_string = format.to_string();
         let capture_flag = request.capture_plots;
 
-        let write_res = std::thread::scope(|s| {
-            s.spawn(move || {
-                let res =
-                    write_chunk_payload(&mut stdin_pipe, seq, capture_flag, format, cwd_str, &code);
-                let _ = send_tx.send((stdin_pipe, res));
-            });
+        std::thread::spawn(move || {
+            let res = write_chunk_payload(
+                &mut input_pipe,
+                seq,
+                capture_flag,
+                &format_string,
+                &cwd_string,
+                &code,
+            );
+            let _ = send_tx.send((input_pipe, res));
+        });
 
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                self.kill();
-                return Err(WaitOutcome::TimedOut);
-            }
-
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let write_res = if remaining.is_zero() {
+            self.kill();
+            Err(WaitOutcome::TimedOut)
+        } else {
             match send_rx.recv_timeout(remaining) {
-                Ok((returned_stdin, Ok(()))) => {
-                    self.stdin = Some(returned_stdin);
+                Ok((returned_input, Ok(()))) => {
+                    self.input = Some(returned_input);
                     Ok(())
                 }
                 Ok((_, Err(_))) => {
@@ -561,18 +791,21 @@ impl Session {
                     Err(WaitOutcome::Terminated)
                 }
             }
-        });
+        };
 
         match write_res {
             Ok(()) => {}
             Err(WaitOutcome::TimedOut) => {
                 let duration_ms = millis(started.elapsed());
+                let (stdout, stdout_trunc) = read_text(&files.out, MAX_STREAM_BYTES);
+                let (stderr, stderr_trunc) = read_text(&files.err, MAX_STREAM_BYTES);
                 let result = ExecutionResult {
-                    stdout: files.read_stdout(),
-                    stderr: files.read_stderr(),
+                    stdout,
+                    stderr,
                     exit_code: None,
                     success: false,
                     timed_out: true,
+                    output_truncated: stdout_trunc || stderr_trunc,
                     plot_png: None,
                     plot_svg: None,
                     tables: Vec::new(),
@@ -592,14 +825,17 @@ impl Session {
             Err(WaitOutcome::Finished) => {}
         }
 
-        let (outcome, extra_stdout) = self.wait_for_end(seq, deadline);
+        let (outcome, extra_stdout, extra_truncated) = self.wait_for_end(seq, deadline);
         let duration_ms = millis(started.elapsed());
 
         match outcome {
             WaitOutcome::Finished => {
                 let mut result = files.read_result(request, duration_ms);
-                if !extra_stdout.is_empty() {
-                    result.stdout.push_str(&extra_stdout);
+                if append_bounded_text(&mut result.stdout, &extra_stdout, MAX_STREAM_BYTES) {
+                    result.output_truncated = true;
+                }
+                if extra_truncated {
+                    result.output_truncated = true;
                 }
                 files.cleanup();
                 self.last_used = Instant::now();
@@ -607,20 +843,24 @@ impl Session {
             }
             WaitOutcome::TimedOut => {
                 self.kill();
-                let mut result = ExecutionResult {
-                    stdout: files.read_stdout(),
-                    stderr: files.read_stderr(),
+                let (mut stdout, stdout_trunc) = read_text(&files.out, MAX_STREAM_BYTES);
+                let (stderr, stderr_trunc) = read_text(&files.err, MAX_STREAM_BYTES);
+                let mut truncated = stdout_trunc || stderr_trunc || extra_truncated;
+                if append_bounded_text(&mut stdout, &extra_stdout, MAX_STREAM_BYTES) {
+                    truncated = true;
+                }
+                let result = ExecutionResult {
+                    stdout,
+                    stderr,
                     exit_code: None,
                     success: false,
                     timed_out: true,
+                    output_truncated: truncated,
                     plot_png: None,
                     plot_svg: None,
                     tables: Vec::new(),
                     duration_ms,
                 };
-                if !extra_stdout.is_empty() {
-                    result.stdout.push_str(&extra_stdout);
-                }
                 files.cleanup();
                 Ok(result)
             }
@@ -636,27 +876,32 @@ impl Session {
         }
     }
 
-    fn wait_for_end(&mut self, seq: u64, deadline: Instant) -> (WaitOutcome, String) {
+    fn wait_for_end(&mut self, seq: u64, deadline: Instant) -> (WaitOutcome, String, bool) {
         let expected = format!("END {seq}");
         let mut extra_stdout = String::new();
+        let mut extra_truncated = false;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return (WaitOutcome::TimedOut, extra_stdout);
+                return (WaitOutcome::TimedOut, extra_stdout, extra_truncated);
             }
             match self.lines.recv_timeout(remaining) {
                 Ok(Some(line)) => {
                     let trimmed = line.trim();
                     if trimmed == expected {
-                        return (WaitOutcome::Finished, extra_stdout);
-                    } else if !trimmed.is_empty() {
-                        extra_stdout.push_str(&line);
+                        return (WaitOutcome::Finished, extra_stdout, extra_truncated);
+                    } else if !trimmed.is_empty()
+                        && append_bounded_text(&mut extra_stdout, &line, MAX_STREAM_BYTES)
+                    {
+                        extra_truncated = true;
                     }
                 }
-                Ok(None) => return (WaitOutcome::Terminated, extra_stdout),
-                Err(RecvTimeoutError::Timeout) => return (WaitOutcome::TimedOut, extra_stdout),
+                Ok(None) => return (WaitOutcome::Terminated, extra_stdout, extra_truncated),
+                Err(RecvTimeoutError::Timeout) => {
+                    return (WaitOutcome::TimedOut, extra_stdout, extra_truncated);
+                }
                 Err(RecvTimeoutError::Disconnected) => {
-                    return (WaitOutcome::Terminated, extra_stdout);
+                    return (WaitOutcome::Terminated, extra_stdout, extra_truncated);
                 }
             }
         }
@@ -664,7 +909,17 @@ impl Session {
 
     fn is_alive(&self) -> bool {
         match self.child.lock() {
-            Ok(mut child) => matches!(child.try_wait(), Ok(None)),
+            Ok(mut child) => match child.try_wait() {
+                Ok(None) => true,
+                Ok(Some(_status)) => {
+                    let target_pgid = self.pgid.lock().ok().and_then(|mut g| g.take());
+                    if let Some(pgid) = target_pgid {
+                        Self::kill_process_group(pgid);
+                    }
+                    false
+                }
+                Err(_) => false,
+            },
             Err(_) => false,
         }
     }
@@ -681,26 +936,32 @@ impl Session {
     }
 
     fn kill(&mut self) {
-        self.stdin.take();
+        self.input.take();
+        let target_pgid = self.pgid.lock().ok().and_then(|mut g| g.take());
+        if let Some(pgid) = target_pgid {
+            Self::kill_process_group(pgid);
+        }
         if let Ok(mut child) = self.child.lock() {
-            Self::kill_process_tree(&mut child);
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 
-    fn kill_process_tree(child: &mut Child) {
-        let pid = child.id();
+    fn kill_process_group(pgid: u32) {
         #[cfg(unix)]
         {
-            let group = format!("-{pid}");
+            let group = format!("-{pgid}");
             let killed = Command::new("/bin/kill")
                 .args(["-9", &group])
                 .output()
-                .is_ok();
+                .map(|out| out.status.success())
+                .unwrap_or(false);
             if !killed {
                 let killed2 = Command::new("/usr/bin/kill")
                     .args(["-9", &group])
                     .output()
-                    .is_ok();
+                    .map(|out| out.status.success())
+                    .unwrap_or(false);
                 if !killed2 {
                     let _ = Command::new("kill").args(["-9", &group]).output();
                 }
@@ -709,18 +970,14 @@ impl Session {
         #[cfg(windows)]
         {
             let _ = Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .args(["/F", "/T", "/PID", &pgid.to_string()])
                 .output();
         }
-        let _ = child.kill();
-        let _ = child.wait();
     }
 
     fn driver_detail(&self) -> String {
         let path = self.temp_dir.join("driver-stderr.txt");
-        let text = fs::read(&path)
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_default();
+        let (text, _) = read_text(&path, 4096);
         let detail = tail(&text, 400);
         if detail.is_empty() {
             "the interpreter process exited".to_string()
@@ -737,8 +994,8 @@ impl Drop for Session {
     }
 }
 
-fn write_chunk_payload(
-    stdin: &mut ChildStdin,
+fn write_chunk_payload<W: Write>(
+    stream: &mut W,
     seq: u64,
     capture: bool,
     format: &str,
@@ -756,14 +1013,14 @@ fn write_chunk_payload(
         cwd_bytes.len(),
         code_bytes.len()
     );
-    stdin.write_all(header.as_bytes())?;
+    stream.write_all(header.as_bytes())?;
     if !cwd_bytes.is_empty() {
-        stdin.write_all(cwd_bytes)?;
+        stream.write_all(cwd_bytes)?;
     }
     if !code_bytes.is_empty() {
-        stdin.write_all(code_bytes)?;
+        stream.write_all(code_bytes)?;
     }
-    stdin.flush()
+    stream.flush()
 }
 
 enum WaitOutcome {
@@ -791,18 +1048,10 @@ impl ChunkFiles {
         }
     }
 
-    fn read_stdout(&self) -> String {
-        read_text(&self.out)
-    }
-
-    fn read_stderr(&self) -> String {
-        read_text(&self.err)
-    }
-
     fn read_result(&self, request: &ExecutionRequest, duration_ms: u64) -> ExecutionResult {
-        let stdout = self.read_stdout();
-        let mut stderr = self.read_stderr();
-        let status = read_text(&self.status);
+        let (stdout, stdout_trunc) = read_text(&self.out, MAX_STREAM_BYTES);
+        let (mut stderr, stderr_trunc) = read_text(&self.err, MAX_STREAM_BYTES);
+        let (status, _) = read_text(&self.status, 1024);
         let success = status.trim() == "ok";
         if status.trim().is_empty() {
             if !stderr.is_empty() && !stderr.ends_with('\n') {
@@ -812,16 +1061,18 @@ impl ChunkFiles {
         }
 
         let effective_format = request.effective_plot_format();
-        let plot_png = if request.capture_plots && effective_format.captures_png() {
-            read_png(&self.png)
+        let (plot_png, png_trunc) = if request.capture_plots && effective_format.captures_png() {
+            read_png(&self.png, MAX_PLOT_BYTES)
         } else {
-            None
+            (None, false)
         };
-        let plot_svg = if request.capture_plots && effective_format.captures_svg() {
-            read_svg(&self.svg)
+        let (plot_svg, svg_trunc) = if request.capture_plots && effective_format.captures_svg() {
+            read_svg(&self.svg, MAX_PLOT_BYTES)
         } else {
-            None
+            (None, false)
         };
+
+        let output_truncated = stdout_trunc || stderr_trunc || png_trunc || svg_trunc;
 
         ExecutionResult {
             stdout,
@@ -829,6 +1080,7 @@ impl ChunkFiles {
             exit_code: Some(i32::from(!success)),
             success,
             timed_out: false,
+            output_truncated,
             plot_png,
             plot_svg,
             tables: Vec::new(),
@@ -856,22 +1108,82 @@ fn plot_format_token(request: &ExecutionRequest) -> &'static str {
     }
 }
 
-fn read_text(path: &Path) -> String {
-    fs::read(path)
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default()
+fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if max_bytes >= s.len() {
+        return s;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &s[..boundary]
 }
 
-fn read_png(path: &Path) -> Option<Vec<u8>> {
-    fs::read(path).ok().filter(|bytes| {
-        bytes.len() > 64 && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
-    })
+fn append_bounded_text(target: &mut String, source: &str, limit: usize) -> bool {
+    if target.len() >= limit {
+        return !source.is_empty();
+    }
+    let remaining_budget = limit - target.len();
+    if source.len() <= remaining_budget {
+        target.push_str(source);
+        false
+    } else {
+        let valid_slice = truncate_to_char_boundary(source, remaining_budget);
+        target.push_str(valid_slice);
+        true
+    }
 }
 
-fn read_svg(path: &Path) -> Option<String> {
-    fs::read_to_string(path).ok().filter(|content| {
-        content.len() > 64 && content.contains("<svg") && content.trim_end().ends_with("</svg>")
-    })
+fn read_text(path: &Path, limit: usize) -> (String, bool) {
+    let Ok(file) = File::open(path) else {
+        return (String::new(), false);
+    };
+    let mut reader = BufReader::new(file);
+    let mut buffer = Vec::new();
+    let _ = reader
+        .by_ref()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut buffer);
+    let truncated = buffer.len() > limit;
+    if truncated {
+        buffer.truncate(limit);
+    }
+    let s = String::from_utf8_lossy(&buffer);
+    let valid_slice = truncate_to_char_boundary(&s, limit);
+    (valid_slice.to_string(), truncated)
+}
+
+fn read_png(path: &Path, limit: usize) -> (Option<Vec<u8>>, bool) {
+    let Ok(file) = File::open(path) else {
+        return (None, false);
+    };
+    let mut reader = BufReader::new(file);
+    let mut bytes = Vec::new();
+    let _ = reader
+        .by_ref()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes);
+    let truncated = bytes.len() > limit;
+    if truncated {
+        return (None, true);
+    }
+    if bytes.len() > 64 && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        (Some(bytes), false)
+    } else {
+        (None, false)
+    }
+}
+
+fn read_svg(path: &Path, limit: usize) -> (Option<String>, bool) {
+    let (content, truncated) = read_text(path, limit);
+    if truncated {
+        return (None, true);
+    }
+    if content.len() > 64 && content.contains("<svg") && content.trim_end().ends_with("</svg>") {
+        (Some(content), false)
+    } else {
+        (None, false)
+    }
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -912,21 +1224,45 @@ os.dup2(DEVNULL_FD, 0)
 os.close(DEVNULL_FD)
 sys.stdin = open(os.devnull, "r", encoding="utf-8")
 
-class StableStream:
-    def __init__(self, fd):
+class StableBuffer:
+    def __init__(self, fd, parent):
         self.fd = fd
+        self.parent = parent
 
     def write(self, data):
-        if not isinstance(data, str):
-            data = str(data)
-        os.write(self.fd, data.encode("utf-8", errors="replace"))
-        return len(data)
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            data = bytes(data)
+        return self.parent._write_bytes(bytes(data))
 
     def flush(self):
         pass
 
     def isatty(self):
         return False
+
+    def fileno(self):
+        return self.fd
+
+    def writable(self):
+        return True
+
+
+class StableStream:
+    def __init__(self, fd, max_bytes=10 * 1024 * 1024 + 1):
+        self.fd = fd
+        self.max_bytes = max_bytes
+        self.bytes_written = 0
+        self.truncated = False
+        self.buffer = StableBuffer(fd, self)
+
+    def fileno(self):
+        return self.fd
+
+    def isatty(self):
+        return False
+
+    def writable(self):
+        return True
 
     @property
     def encoding(self):
@@ -935,6 +1271,32 @@ class StableStream:
     @property
     def errors(self):
         return "replace"
+
+    def reset_chunk(self):
+        self.bytes_written = 0
+        self.truncated = False
+
+    def _write_bytes(self, b):
+        if self.bytes_written >= self.max_bytes:
+            self.truncated = True
+            return len(b)
+        rem = self.max_bytes - self.bytes_written
+        to_write = b[:rem]
+        if len(to_write) < len(b):
+            self.truncated = True
+        os.write(self.fd, to_write)
+        self.bytes_written += len(to_write)
+        return len(b)
+
+    def write(self, data):
+        if not isinstance(data, str):
+            data = str(data)
+        b = data.encode("utf-8", errors="replace")
+        self._write_bytes(b)
+        return len(data)
+
+    def flush(self):
+        pass
 
 STABLE_STDOUT = StableStream(1)
 STABLE_STDERR = StableStream(2)
@@ -989,7 +1351,8 @@ def snapshot_figures():
             if num is None:
                 continue
             art_count = sum(len(ax.get_children()) for ax in fig.axes)
-            snaps[num] = (len(fig.axes), art_count)
+            stale = bool(getattr(fig, "stale", False))
+            snaps[num] = (id(fig), len(fig.axes), art_count, stale)
         except Exception:
             pass
     return snaps
@@ -1005,7 +1368,17 @@ def capture_plots(seq, fmt, before_snaps):
             num = getattr(fig, "number", None)
             if num is None:
                 continue
-            if num not in before_snaps or before_snaps[num] != after_snaps.get(num) or getattr(fig, "stale", False):
+            before = before_snaps.get(num)
+            if before is None or before[0] != id(fig):
+                active_fig = fig
+                break
+            after = after_snaps.get(num)
+            if before[1:3] != (after[1:3] if after else None):
+                active_fig = fig
+                break
+            is_stale_now = bool(getattr(fig, "stale", False))
+            was_stale_before = before[3]
+            if is_stale_now and not was_stale_before:
                 active_fig = fig
                 break
         if active_fig is None:
@@ -1066,6 +1439,8 @@ def main():
         os.dup2(out_file.fileno(), 1)
         os.dup2(err_file.fileno(), 2)
 
+        STABLE_STDOUT.reset_chunk()
+        STABLE_STDERR.reset_chunk()
         sys.stdout = STABLE_STDOUT
         sys.stderr = STABLE_STDERR
 
@@ -1078,10 +1453,16 @@ def main():
             exec(compile(code + "\n", "<wordcraft-chunk>", "exec"), NAMESPACE)
         except SystemExit as exc:
             status = "error"
-            sys.stderr.write("The chunk tried to exit the session: %s\n" % exc)
+            try:
+                err_file.write("The chunk tried to exit the session: %s\n" % exc)
+            except Exception:
+                pass
         except BaseException:
             status = "error"
-            sys.stderr.write(traceback.format_exc())
+            try:
+                err_file.write(traceback.format_exc())
+            except Exception:
+                pass
         finally:
             try:
                 out_file.flush()
@@ -1109,6 +1490,12 @@ def main():
 
         if capture:
             capture_plots(seq, fmt, before_figures)
+        else:
+            for fig in get_all_figures():
+                try:
+                    fig.stale = False
+                except Exception:
+                    pass
 
         with open(status_path, "w", encoding="utf-8") as sf:
             sf.write(status)
@@ -1127,6 +1514,7 @@ const R_DRIVER: &str = r##"options(warn = 1L)
 
 .wc_driver$args <- base::commandArgs(trailingOnly = TRUE)
 .wc_driver$base <- if (base::length(.wc_driver$args) > 0L) .wc_driver$args[[1L]] else base::tempdir()
+.wc_driver$port <- if (base::length(.wc_driver$args) >= 2L) base::as.integer(.wc_driver$args[[2L]]) else NA_integer_
 .wc_driver$has_plot <- FALSE
 
 .wc_driver$hook_fn <- function(...) { .wc_driver$has_plot <- TRUE }
@@ -1201,8 +1589,24 @@ base::environment(.wc_driver$wrap_devoff) <- .wc_driver
 base::environment(.wc_driver$protect_con) <- .wc_driver
 
 .wc_driver$run <- function() {
-  con <- base::file("stdin", "rb")
+  con <- if (!base::is.na(.wc_driver$port) && .wc_driver$port > 0L) {
+    base::socketConnection(host = "127.0.0.1", port = .wc_driver$port, open = "r+b", blocking = TRUE, timeout = 2147483647L)
+  } else {
+    base::file("stdin", "rb")
+  }
   .wc_driver$protect_con(con)
+
+  auth_token <- base::Sys.getenv("WORDCRAFT_AUTH_TOKEN")
+  if (!base::nzchar(auth_token)) {
+    auth_file <- base::file.path(.wc_driver$base, "auth.txt")
+    if (base::file.exists(auth_file)) {
+      auth_lines <- base::tryCatch(base::readLines(auth_file, n = 1L, warn = FALSE), error = function(e) "")
+      if (base::length(auth_lines) > 0L) auth_token <- auth_lines[[1L]]
+    }
+  }
+  base::writeLines(base::paste0("AUTH ", auth_token), con, useBytes = TRUE)
+  base::flush(con)
+
   repeat {
     header_line <- base::readLines(con, n = 1L, warn = FALSE)
     if (base::length(header_line) == 0L) break
@@ -1304,7 +1708,10 @@ base::environment(.wc_driver$protect_con) <- .wc_driver
         for (i in base::seq_along(parsed)) {
           val <- base::withVisible(base::eval(parsed[[i]], envir = .GlobalEnv))
           if (base::isTRUE(val$visible)) {
-            base::print(val$value)
+            base::eval(
+              base::as.call(base::list(base::as.name("print"), base::call("quote", val$value))),
+              envir = .GlobalEnv
+            )
           }
         }
         NULL
@@ -1315,7 +1722,12 @@ base::environment(.wc_driver$protect_con) <- .wc_driver
       }
     }
     if (base::nzchar(error_message)) {
-      base::cat("Error: ", error_message, "\n", sep = "", file = err_con)
+      err_valid <- base::tryCatch(base::isTRUE(base::isOpen(err_con)), error = function(e) FALSE)
+      if (err_valid) {
+        base::try(base::cat("Error: ", error_message, "\n", sep = "", file = err_con), silent = TRUE)
+      } else {
+        base::try(base::cat("Error: ", error_message, "\n", sep = "", file = err_path, append = TRUE), silent = TRUE)
+      }
     }
 
     .wc_driver$close_sinks()
