@@ -360,6 +360,35 @@ fn cli_closed_stdout_pipe_does_not_panic() {
 
 #[cfg(unix)]
 #[test]
+fn cli_closed_stdout_pipe_keeps_the_script_exit_status() {
+    if wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python).is_none() {
+        return;
+    }
+
+    let mut child = Command::new(binary_path())
+        .args([
+            "--lang",
+            "py",
+            "-e",
+            "import sys\nprint('x' * 65536)\nsys.exit(3)",
+            "--no-plot",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn wc-kernel");
+    drop(child.stdout.take().expect("stdout piped"));
+
+    let output = child.wait_with_output().expect("wait for wc-kernel");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "a closed pipe must not replace the script exit status"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn cli_resolves_interpreter_before_changing_directory() {
     let Some(python) = wordcraft_kernel::which_binary(wordcraft_kernel::CodeLanguage::Python)
     else {

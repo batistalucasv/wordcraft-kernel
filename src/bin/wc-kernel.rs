@@ -63,7 +63,6 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 enum CliError {
     Usage(String),
     Runtime(String),
-    BrokenPipe,
 }
 
 #[derive(Debug, Default)]
@@ -172,30 +171,28 @@ fn set_file_path(cli: &mut CliArgs, path: PathBuf) -> Result<(), CliError> {
     Ok(())
 }
 
-fn output_error(error: io::Error) -> CliError {
-    if error.kind() == io::ErrorKind::BrokenPipe {
-        CliError::BrokenPipe
-    } else {
-        CliError::Runtime(format!("failed to write output: {error}"))
+fn write_all(handle: &mut impl Write, bytes: &[u8]) -> Result<(), CliError> {
+    match handle.write_all(bytes).and_then(|()| handle.flush()) {
+        Ok(()) => Ok(()),
+        // The reader closed the pipe. Stop reporting, but let the completed
+        // script's own exit status decide how the CLI ends.
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(CliError::Runtime(format!(
+            "failed to write output: {error}"
+        ))),
     }
 }
 
 fn write_stdout(text: &str) -> Result<(), CliError> {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
-    handle
-        .write_all(text.as_bytes())
-        .and_then(|()| handle.flush())
-        .map_err(output_error)
+    write_all(&mut handle, text.as_bytes())
 }
 
 fn write_stderr(text: &str) -> Result<(), CliError> {
     let stderr = io::stderr();
     let mut handle = stderr.lock();
-    handle
-        .write_all(text.as_bytes())
-        .and_then(|()| handle.flush())
-        .map_err(output_error)
+    write_all(&mut handle, text.as_bytes())
 }
 
 /// Read all of stdin while staying responsive to cancellation.
@@ -672,8 +669,6 @@ fn main() -> ExitCode {
             let _ = writeln!(io::stderr(), "wc-kernel: error: {msg}");
             ExitCode::from(1)
         }
-        // A closed pipe is the reader's choice, not an execution failure.
-        Err(CliError::BrokenPipe) => ExitCode::SUCCESS,
     }
 }
 

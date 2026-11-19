@@ -32,9 +32,6 @@ static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Maximum bytes kept from each captured stream (stdout and stderr).
 const MAX_CAPTURE_BYTES: usize = 10 * 1024 * 1024;
 
-/// Pid record the supervisor writes before it starts the interpreter.
-const INTERPRETER_PID_FILE: &str = "__wordcraft_interpreter__.pid";
-
 /// How long the supervisor gets to cancel the interpreter before it is killed.
 #[cfg(unix)]
 const SUPERVISOR_CLEANUP_GRACE: Duration = Duration::from_secs(4);
@@ -428,14 +425,12 @@ pub fn execute_with_cancellation(
 
     let supervisor = find_supervisor_binary(request.supervisor_path.as_deref())?;
     let result_file = temp_dir.join("__wordcraft_result__.bin");
-    let interpreter_pid_file = temp_dir.join(INTERPRETER_PID_FILE);
     let supervisor_stderr_path = temp_dir.join("__wordcraft_supervisor_stderr__.log");
     let mut cmd = Command::new(&supervisor);
     cmd.arg("--run")
         .arg(&binary)
         .arg(&script_file)
         .arg(&result_file)
-        .arg(&interpreter_pid_file)
         .arg(request.timeout_ms.to_string());
     if request.language == CodeLanguage::R {
         cmd.env("WORDCRAFT_USER_SCRIPT", &user_file)
@@ -473,7 +468,7 @@ pub fn execute_with_cancellation(
     let status = match wait_for_supervisor(&mut child, supervisor_timeout, cancelled) {
         Ok(status) => status,
         Err(error) => {
-            let cleanup = terminate_supervisor_process_tree(&mut child, &interpreter_pid_file);
+            let cleanup = terminate_supervisor_process_tree(&mut child);
             if error.kind() == std::io::ErrorKind::Interrupted {
                 cleanup.map_err(|cleanup| {
                     KernelError::Io(format!("execution interrupted; cleanup failed: {cleanup}"))
@@ -693,10 +688,7 @@ fn wait_for_supervisor(
     }
 }
 
-fn terminate_supervisor_process_tree(
-    child: &mut GroupChild,
-    interpreter_pid_file: &Path,
-) -> std::io::Result<()> {
+fn terminate_supervisor_process_tree(child: &mut GroupChild) -> std::io::Result<()> {
     // Ask the supervisor to stop the interpreter and its workers itself, so it
     // can run its own cleanup before it exits.
     #[cfg(unix)]
@@ -727,21 +719,15 @@ fn terminate_supervisor_process_tree(
         }
     }
 
-    force_terminate_supervisor_process_group(child, interpreter_pid_file)
+    force_terminate_supervisor_process_group(child)
 }
 
 /// Hard fallback: the supervisor ignored the cancellation request.
 ///
-/// The supervisor's own group covers the interpreter on Linux. Elsewhere the
-/// interpreter leads its own group, whose PID was recorded before it started.
-fn force_terminate_supervisor_process_group(
-    child: &mut GroupChild,
-    #[cfg_attr(not(all(unix, not(target_os = "linux"))), allow(unused_variables))]
-    interpreter_pid_file: &Path,
-) -> std::io::Result<()> {
-    #[cfg(all(unix, not(target_os = "linux")))]
-    kill_recorded_interpreter_group(interpreter_pid_file);
-
+/// Only the group this process created is signalled. A recorded interpreter
+/// PID cannot prove that its group is still the interpreter's, so the
+/// interpreter itself is left to the supervisor's cancellation handler.
+fn force_terminate_supervisor_process_group(child: &mut GroupChild) -> std::io::Result<()> {
     match child.kill() {
         Ok(()) => child.wait().map(|_| ()),
         Err(kill_error) => match child.try_wait() {
@@ -752,22 +738,6 @@ fn force_terminate_supervisor_process_group(
             ))),
         },
     }
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn kill_recorded_interpreter_group(path: &Path) {
-    use nix::sys::signal::{Signal, killpg};
-    use nix::unistd::Pid;
-
-    let Some(pid) = fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<i32>().ok())
-    else {
-        return;
-    };
-    // The interpreter either still runs or is an unreaped zombie owned by the
-    // supervisor, so its group cannot have been recycled yet.
-    let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
 }
 
 fn create_private_file(path: &Path) -> std::io::Result<fs::File> {

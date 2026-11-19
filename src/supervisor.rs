@@ -157,7 +157,6 @@ pub fn run() -> io::Result<()> {
     let binary = next_path(&mut args, "interpreter path")?;
     let script = next_path(&mut args, "script path")?;
     let result_file = next_path(&mut args, "result path")?;
-    let interpreter_pid_file = next_path(&mut args, "interpreter pid path")?;
     let timeout_ms = args
         .next()
         .and_then(|arg| arg.into_string().ok())
@@ -177,7 +176,6 @@ pub fn run() -> io::Result<()> {
     let result = execute_child(
         &binary,
         &script,
-        &interpreter_pid_file,
         &interpreter_args,
         Duration::from_millis(timeout_ms),
         &CANCELLED,
@@ -202,24 +200,9 @@ struct SupervisorResult {
     duration_ms: u64,
 }
 
-/// Record the interpreter PID so a watchdog can still reach its process group
-/// if this supervisor is killed before it finishes cleanup.
-fn write_interpreter_pid(path: &Path, pid: u32) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    writeln!(file, "{pid}")
-}
-
 fn execute_child(
     binary: &Path,
     script: &Path,
-    interpreter_pid_file: &Path,
     interpreter_args: &[OsString],
     timeout: Duration,
     cancelled: &AtomicBool,
@@ -236,14 +219,6 @@ fn execute_child(
     let mut child = spawn_child(&mut command)
         .map_err(|error| io::Error::other(format!("spawn interpreter: {error}")))?;
     let child_pid = child.id();
-
-    if let Err(error) = write_interpreter_pid(interpreter_pid_file, child_pid) {
-        return Err(cleanup_after_failure(
-            io::Error::other(format!("record interpreter pid: {error}")),
-            cleanup_process_tree(&mut child, child_pid, false),
-            None,
-        ));
-    }
 
     let stdout_pipe = child.take_stdout();
     let stderr_pipe = child.take_stderr();

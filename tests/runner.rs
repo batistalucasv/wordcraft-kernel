@@ -304,6 +304,10 @@ fn forced_supervisor_termination_kills_its_process_group() {
 #[cfg(target_os = "linux")]
 #[test]
 fn cancellation_lets_the_supervisor_clean_up_before_the_hard_fallback() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
     use std::os::unix::fs::PermissionsExt;
 
     let temp_dir = TempTestDir::create("wc-supervisor-cancel");
