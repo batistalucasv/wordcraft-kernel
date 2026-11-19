@@ -1,81 +1,87 @@
 # WordCraft Kernel
 
-Motor de execução segura e isolada de código (**R** e **Python**) para o ecossistema do **WordCraft** e computação científica interativa.
+Safe, isolated execution runner for **R** and **Python** code chunks, designed for the **WordCraft** word processor ecosystem and interactive literate computing.
 
-Desenvolvido especialmente para pesquisa em **Ecologia**, ciência de dados e **ensino prático de programação e estatística**, permitindo a criação de blocos de código (*code chunks*) no estilo Quarto / R Markdown / Jupyter dentro de processadores de texto nativos.
+Developed specifically for research in **Ecology**, statistical data science, and **interactive programming education**, enabling live code chunks (similar to Quarto / R Markdown / Jupyter) embedded directly inside native word processor documents.
 
 ---
 
-## Características
+## Features
 
-- **100% Rust Nativo:** Sem C-FFI instável, sem código inseguro (`unsafe_code = "forbid"`), sem panics (`clippy::unwrap_used` negado no código de produção).
-- **Paridade R e Python:** Mesma interface, mesma captura de saídas e tratamento de erros.
-- **Proteção "Never Crash":** Execução em processos isolados com controle de tempo (*timeout* ajustável) para encerrar scripts travados ou em loop infinito.
-- **Captura Automática de Gráficos:** Detecta e extrai plots em alta resolução gerados por:
-  - **R:** Funções básicas (`plot()`, `hist()`, `boxplot()`) e pacotes modernos (`ggplot2`).
+- **100% Native Rust:** No unstable C-FFI, no unsafe code (`unsafe_code = "forbid"`), zero panics (`clippy::unwrap_used` denied in production code).
+- **R & Python Parity:** Unified interface, consistent output capture, and standardized error handling across languages.
+- **"Never Crash" Architecture:** Runs code in isolated child processes with configurable execution timeouts, terminating infinite loops and hung scripts automatically.
+- **Dual Format Plot Capture:** Intercepts and extracts plots in both lossless vector (**SVG**) and high-resolution raster (**PNG**) formats:
+  - **R:** Base graphics (`plot()`, `hist()`, `boxplot()`) and modern packages (`ggplot2`).
   - **Python:** `matplotlib`, `seaborn`, etc.
-- **Captura Limpa de Saída:** Separação estrita de `stdout`, `stderr`, código de saída e tempo de execução decorrido.
+  - Configurable via `PlotFormat::Png`, `PlotFormat::Svg`, and `PlotFormat::Both`.
+  - `with_prefer_svg(true)` upgrades the default PNG capture to SVG; an explicit `PlotFormat::Both` is preserved.
+- **Clean Output Streams:** Strict separation of standard output (`stdout`), standard error (`stderr`), exit codes, and elapsed execution time.
 
 ---
 
-## Como Usar
+## Getting Started
 
-### Adicionando como Dependência
+### Adding as a Dependency
 
-No seu `Cargo.toml`:
+In your `Cargo.toml`:
 
 ```toml
 [dependencies]
 wordcraft-kernel = { git = "https://github.com/batistalucasv/wordcraft-kernel" }
 ```
 
-### Exemplo em Rust
+### Rust Example
 
 ```rust
-use wordcraft_kernel::{execute, CodeLanguage, ExecutionRequest};
+use wordcraft_kernel::{execute, CodeLanguage, ExecutionRequest, PlotFormat};
 
 fn main() {
-    // Exemplo com R
+    // R example with SVG plot capture
     let r_code = r#"
-        especies <- c("Sp1", "Sp2", "Sp3")
-        abundancia <- c(10, 25, 5)
-        cat("Total de indivíduos:", sum(abundancia), "\n")
-        barplot(abundancia, names.arg = especies, main = "Abundância")
+        species <- c("Species A", "Species B", "Species C")
+        abundance <- c(10, 25, 5)
+        cat("Total individuals:", sum(abundance), "\n")
+        barplot(abundance, names.arg = species, main = "Species Abundance")
     "#;
 
     let req = ExecutionRequest::new(CodeLanguage::R, r_code)
         .with_timeout(10_000)
-        .with_plot_capture(true);
+        .with_plot_capture(true)
+        .with_plot_format(PlotFormat::Both);
 
     match execute(&req) {
         Ok(result) => {
-            println!("Saída do R:\n{}", result.stdout);
+            println!("R Output:\n{}", result.stdout);
             if let Some(png_bytes) = result.plot_png {
-                println!("Gráfico gerado! Tamanho: {} bytes", png_bytes.len());
+                println!("Raster PNG captured: {} bytes", png_bytes.len());
+            }
+            if let Some(svg_str) = result.plot_svg {
+                println!("Vector SVG captured: {} characters", svg_str.len());
             }
         }
-        Err(err) => eprintln!("Erro ao executar: {err}"),
+        Err(err) => eprintln!("Execution error: {err}"),
     }
 
-    // Exemplo com Python
+    // Python example
     let py_code = r#"
         import numpy as np
-        dados = np.array([12, 15, 18, 22, 30])
-        print("Média:", np.mean(dados))
+        data = np.array([12, 15, 18, 22, 30])
+        print("Mean:", np.mean(data))
     "#;
 
     let req_py = ExecutionRequest::new(CodeLanguage::Python, py_code);
     if let Ok(res) = execute(&req_py) {
-        println!("Saída do Python:\n{}", res.stdout);
+        println!("Python Output:\n{}", res.stdout);
     }
 }
 ```
 
 ---
 
-## Testes
+## Testing
 
-Para executar os testes automatizados:
+Run automated tests:
 
 ```bash
 cargo test
@@ -83,6 +89,6 @@ cargo test
 
 ---
 
-## Licença
+## License
 
-Distribuído sob as licenças **MIT** ou **Apache-2.0**.
+Distributed under either the **MIT** or **Apache-2.0** license.
