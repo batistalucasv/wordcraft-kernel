@@ -35,6 +35,27 @@ fn execution_request_defaults() {
 }
 
 #[test]
+fn execution_request_deserialization_defaults_plot_options() {
+    let omitted =
+        r#"{"language":"python","code":"print('hello')","timeout_ms":1000,"capture_plots":true}"#;
+    let request: ExecutionRequest = serde_json::from_str(omitted).expect("deserialize request");
+    assert_eq!(request.plot_format, PlotFormat::Png);
+    assert!(!request.prefer_svg);
+
+    let explicit_format = r#"{"language":"python","code":"","timeout_ms":1000,"capture_plots":false,"plot_format":"svg"}"#;
+    let request: ExecutionRequest =
+        serde_json::from_str(explicit_format).expect("deserialize explicit format");
+    assert_eq!(request.plot_format, PlotFormat::Svg);
+    assert!(!request.prefer_svg);
+
+    let explicit_preference = r#"{"language":"python","code":"","timeout_ms":1000,"capture_plots":false,"prefer_svg":true}"#;
+    let request: ExecutionRequest =
+        serde_json::from_str(explicit_preference).expect("deserialize explicit preference");
+    assert_eq!(request.plot_format, PlotFormat::Png);
+    assert!(request.prefer_svg);
+}
+
+#[test]
 fn python_basic_execution() {
     if !is_language_available(CodeLanguage::Python) {
         return;
@@ -195,6 +216,29 @@ plot(x, y, main = "Test Both Curve")
     assert!(result.plot_png.is_some(), "Expected PNG bytes");
     assert!(result.plot_svg.is_some(), "Expected SVG string");
     assert!(result.plot_svg.unwrap().contains("<svg"));
+}
+
+#[test]
+fn r_plot_both_capture_device_closed_by_user() {
+    if !is_language_available(CodeLanguage::R) {
+        return;
+    }
+
+    let code = r#"
+plot(1:5)
+dev.off()
+pdf(tempfile(fileext = ".pdf"))
+plot(5:1)
+"#;
+    let req = ExecutionRequest::new(CodeLanguage::R, code).with_plot_format(PlotFormat::Both);
+    let result = execute(&req).expect("execution failed");
+
+    assert!(result.success);
+    assert!(result.plot_png.is_some(), "Expected completed PNG bytes");
+    assert!(
+        result.plot_svg.is_none(),
+        "Must not copy the other active device as the SVG"
+    );
 }
 
 fn python_has_matplotlib() -> bool {
