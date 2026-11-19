@@ -15,6 +15,7 @@ Developed specifically for research in **Ecology**, statistical data science, an
   - **R:** Base graphics (`plot()`, `hist()`, `boxplot()`) and modern packages (`ggplot2`).
   - **Python:** `matplotlib`, `seaborn`, etc.
   - Configurable via `PlotFormat::Png`, `PlotFormat::Svg`, and `PlotFormat::Both`.
+  - `with_prefer_svg(true)` upgrades the default PNG capture to SVG; an explicit `PlotFormat::Both` is preserved.
 - **Clean Output Streams:** Strict separation of standard output (`stdout`), standard error (`stderr`), exit codes, and elapsed execution time.
 - **Template Library:** Ready-to-run, commented ecology and statistics snippets for R and Python, described in `templates`.
 
