@@ -1400,3 +1400,102 @@ fn r_tables_beyond_capacity_are_printed_to_stdout() {
         res.stdout
     );
 }
+
+#[test]
+fn table_payload_concurrent_growth_beyond_limit_is_rejected() {
+    let unique_id = format!(
+        "wordcraft-tables-grow-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let dir = std::env::temp_dir().join(unique_id);
+    create_scratch_dir(&dir).expect("create scratch dir");
+    let _guard = TempDirGuard(&dir);
+    let path = dir.join("tables.json");
+
+    // Write a small payload that passes the metadata size check.
+    let small_payload = br#"{"tables":[{"headers":["h"],"rows":[["val"]]}]}"#;
+    fs::write(&path, small_payload).expect("write small payload");
+
+    // Open the file handle while it is within the 64 MiB limit (simulating TOCTOU).
+    let file = fs::File::open(&path).expect("open file for reading");
+
+    // Concurrently grow the file beyond the MAX_TABLES_FILE_BYTES limit.
+    // set_len expands the file metadata/content instantly without disk thrashing.
+    let grow_file = fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open for writing");
+    grow_file
+        .set_len(MAX_TABLES_FILE_BYTES + 1024)
+        .expect("expand file past limit");
+
+    // Re-reading from the concurrently expanded file handle must reject the oversized payload
+    // without reading beyond MAX_TABLES_FILE_BYTES + 1 bytes.
+    let result = read_tables_from_reader(file, MAX_TABLES_FILE_BYTES, MAX_TOTAL_CELLS);
+    assert!(
+        result.is_empty(),
+        "concurrently grown file exceeding byte limit must be rejected"
+    );
+
+    // Also verify that read_tables on the path directly rejects it.
+    let path_result = read_tables(&path);
+    assert!(
+        path_result.is_empty(),
+        "oversized file must be rejected by read_tables"
+    );
+}
+
+#[test]
+fn table_payload_ragged_zip_bomb_memory_amplification_is_rejected() {
+    let unique_id = format!(
+        "wordcraft-tables-zipbomb-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let dir = std::env::temp_dir().join(unique_id);
+    create_scratch_dir(&dir).expect("create scratch dir");
+    let _guard = TempDirGuard(&dir);
+    let path = dir.join("tables.json");
+
+    // Construct a small JSON payload (< 10 KB) declaring 256 headers and 1,000 empty rows ([]).
+    // This projects to 256,000 cells (> MAX_TOTAL_CELLS = 250,000).
+    // Without the projection check, padding would allocate 256,000 String slots.
+    let headers: Vec<String> = (0..256).map(|i| format!("\"c{i}\"")).collect();
+    let empty_rows: Vec<&str> = vec!["[]"; 1_000];
+    let payload = format!(
+        r#"{{"tables":[{{"headers":[{}],"rows":[{}]}}]}}"#,
+        headers.join(","),
+        empty_rows.join(",")
+    );
+
+    fs::write(&path, payload).expect("write zip bomb payload");
+
+    let tables = read_tables(&path);
+    assert!(
+        tables.is_empty(),
+        "payload exceeding aggregate cell projection budget must be rejected before padding"
+    );
+}
+
+#[test]
+fn read_tables_from_reader_rejects_payload_with_extra_byte_beyond_limit() {
+    use std::io::Cursor;
+    // Simulate reader that returns max_bytes + 1 bytes.
+    let small_limit = 100;
+    let mut data = Vec::new();
+    data.extend_from_slice(b"{\"tables\":[]}");
+    data.resize(small_limit + 1, b' ');
+    let reader = Cursor::new(data);
+    let result = read_tables_from_reader(reader, small_limit as u64, MAX_TOTAL_CELLS);
+    assert!(
+        result.is_empty(),
+        "payload with extra byte beyond limit must be rejected"
+    );
+}

@@ -104,8 +104,8 @@ if let Ok(result) = execute(&ExecutionRequest::new(CodeLanguage::R, code)) {
 ```
 
 Both writers are bounded: at most 16 tables per run, 10,000 rows and 256 columns per
-table, and 4,096 characters per cell. A malformed or oversized payload yields no tables
-instead of an error.
+table, 4,096 characters per cell, and 250,000 total cells. A malformed or oversized payload
+yields no tables instead of an error.
 
 ---
 

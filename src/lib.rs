@@ -114,8 +114,8 @@ impl PlotFormat {
 /// usable, where the term names are row names rather than a column.
 ///
 /// Capture is bounded: at most 16 tables per execution, 10,000 rows and 256 columns
-/// per table, and 4,096 characters per cell. Anything past those limits is dropped,
-/// and a payload larger than 64 MiB is ignored entirely.
+/// per table, 4,096 characters per cell, and at most 250,000 total cells across all tables.
+/// Anything past those limits is dropped, and a payload larger than 64 MiB is ignored entirely.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TabularOutput {
@@ -133,6 +133,8 @@ const MAX_TABLE_ROWS: usize = 10_000;
 const MAX_TABLE_COLUMNS: usize = 256;
 /// Maximum number of characters kept in a single cell.
 const MAX_CELL_CHARS: usize = 4_096;
+/// Maximum aggregate cell count across all tables before padding to prevent memory amplification.
+const MAX_TOTAL_CELLS: usize = 250_000;
 /// Maximum size of the table payload a script may hand back.
 const MAX_TABLES_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -193,10 +195,7 @@ impl ExecutionRequest {
         self
     }
 
-    /// Prefer lossless vector SVG output over the default PNG.
-    ///
-    /// Upgrades `PlotFormat::Png` to `PlotFormat::Svg`. Has no effect if
-    /// `PlotFormat::Both` was explicitly selected.
+    /// Set SVG preference flag directly.
     pub fn with_prefer_svg(mut self, prefer: bool) -> Self {
         self.prefer_svg = prefer;
         self
@@ -214,7 +213,7 @@ impl ExecutionRequest {
         }
     }
 
-    /// Set an explicit working directory for execution.
+    /// Set an explicit working directory.
     pub fn with_working_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.working_dir = Some(dir.into());
         self
@@ -696,20 +695,49 @@ fn read_tables(path: &Path) -> Vec<TabularOutput> {
     if !metadata.is_file() || metadata.len() > MAX_TABLES_FILE_BYTES {
         return Vec::new();
     }
-    let raw = match fs::read(path) {
-        Ok(raw) => raw,
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(_) => return Vec::new(),
     };
+    read_tables_from_reader(file, MAX_TABLES_FILE_BYTES, MAX_TOTAL_CELLS)
+}
+
+/// Read and validate tabular data from a reader under strict byte and cell budgets.
+fn read_tables_from_reader<R: Read>(
+    reader: R,
+    max_bytes: u64,
+    max_cells: usize,
+) -> Vec<TabularOutput> {
+    let mut raw = Vec::new();
+    let mut limited = reader.take(max_bytes.saturating_add(1));
+    if limited.read_to_end(&mut raw).is_err() || raw.len() > max_bytes as usize {
+        return Vec::new();
+    }
     let payload: RawTables = match serde_json::from_slice(&raw) {
         Ok(payload) => payload,
         Err(_) => return Vec::new(),
     };
-    payload
-        .tables
-        .into_iter()
-        .filter_map(normalize_table)
-        .take(MAX_TABLES)
-        .collect()
+
+    let tables: Vec<RawTable> = payload.tables.into_iter().take(MAX_TABLES).collect();
+    let mut total_projected_cells: usize = 0;
+    for table in &tables {
+        let width = table.headers.len().min(MAX_TABLE_COLUMNS);
+        let row_count = table.rows.len().min(MAX_TABLE_ROWS);
+        match width.checked_mul(row_count) {
+            Some(cells) => {
+                total_projected_cells = match total_projected_cells.checked_add(cells) {
+                    Some(sum) => sum,
+                    None => return Vec::new(),
+                };
+            }
+            None => return Vec::new(),
+        }
+    }
+    if total_projected_cells > max_cells {
+        return Vec::new();
+    }
+
+    tables.into_iter().filter_map(normalize_table).collect()
 }
 
 /// Clamp a table to the documented limits and make every row as wide as the headers.
