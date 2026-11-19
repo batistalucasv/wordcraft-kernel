@@ -16,6 +16,27 @@ fn chunk(language: CodeLanguage, code: &str) -> ExecutionRequest {
     ExecutionRequest::new(language, code).with_timeout(10_000)
 }
 
+struct TempDirGuard(std::path::PathBuf);
+
+impl TempDirGuard {
+    fn new(prefix: &str) -> Self {
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|elapsed| elapsed.as_nanos()).unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()));
+        fs::create_dir(&dir).expect("create test temp dir");
+        Self(dir)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn session_probe(language: CodeLanguage, id: &str, code: &str) -> bool {
     if !is_language_available(language) {
         return false;
@@ -25,6 +46,9 @@ fn session_probe(language: CodeLanguage, id: &str, code: &str) -> bool {
     let result = manager.execute(id, &request);
     manager.close_session(id);
     match result {
+        Ok(res) if res.timed_out => {
+            panic!("graphics probe timed out for {language:?}: stdout={:?} stderr={:?}", res.stdout, res.stderr);
+        }
         Ok(res) => res.success,
         Err(error) => panic!("graphics probe infrastructure error for {language:?}: {error}"),
     }
@@ -33,33 +57,19 @@ fn session_probe(language: CodeLanguage, id: &str, code: &str) -> bool {
 fn python_has_matplotlib() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        session_probe(
-            CodeLanguage::Python,
-            "probe-matplotlib",
-            "import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt",
-        )
+        session_probe(CodeLanguage::Python, "probe-matplotlib", "import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt")
     })
 }
 
 fn r_has_png_device() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        session_probe(
-            CodeLanguage::R,
-            "probe-r-png",
-            "tf <- tempfile(fileext = '.png'); png(tf); dev.off(); unlink(tf)",
-        )
-    })
+    *AVAILABLE.get_or_init(|| session_probe(CodeLanguage::R, "probe-r-png", "tf <- tempfile(fileext = '.png'); png(tf); dev.off(); unlink(tf)"))
 }
 
 fn r_has_svg_device() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        session_probe(
-            CodeLanguage::R,
-            "probe-r-svg",
-            "tf <- tempfile(fileext = '.svg'); grDevices::svg(tf); grDevices::dev.off(); unlink(tf)",
-        )
+        session_probe(CodeLanguage::R, "probe-r-svg", "tf <- tempfile(fileext = '.svg'); grDevices::svg(tf); grDevices::dev.off(); unlink(tf)")
     })
 }
 
@@ -70,15 +80,11 @@ fn python_session_keeps_variables_between_executions() {
     };
 
     let first = chunk(CodeLanguage::Python, "total = 40 + 2");
-    let result1 = manager
-        .execute("py-state", &first)
-        .expect("execute chunk 1");
+    let result1 = manager.execute("py-state", &first).expect("execute chunk 1");
     assert!(result1.success, "stderr: {}", result1.stderr);
 
     let second = chunk(CodeLanguage::Python, "print(f'total is {total}')");
-    let result2 = manager
-        .execute("py-state", &second)
-        .expect("execute chunk 2");
+    let result2 = manager.execute("py-state", &second).expect("execute chunk 2");
     assert!(result2.success, "stderr: {}", result2.stderr);
     assert_eq!(result2.stdout.trim(), "total is 42");
 
@@ -95,13 +101,8 @@ fn r_session_keeps_variables_between_executions() {
     let result1 = manager.execute("r-state", &first).expect("execute chunk 1");
     assert!(result1.success, "stderr: {}", result1.stderr);
 
-    let second = chunk(
-        CodeLanguage::R,
-        "cat(\"total is \", total, \"\\n\", sep = \"\")",
-    );
-    let result2 = manager
-        .execute("r-state", &second)
-        .expect("execute chunk 2");
+    let second = chunk(CodeLanguage::R, "cat(\"total is \", total, \"\\n\", sep = \"\")");
+    let result2 = manager.execute("r-state", &second).expect("execute chunk 2");
     assert!(result2.success, "stderr: {}", result2.stderr);
     assert_eq!(result2.stdout.trim(), "total is 42");
 
@@ -118,10 +119,7 @@ fn sessions_do_not_share_state() {
     let r1 = manager.execute("session-a", &first).expect("execute chunk");
     assert!(r1.success);
 
-    let probe = chunk(
-        CodeLanguage::Python,
-        "print('defined' if 'x' in globals() else 'missing')",
-    );
+    let probe = chunk(CodeLanguage::Python, "print('defined' if 'x' in globals() else 'missing')");
     let r2 = manager.execute("session-b", &probe).expect("execute chunk");
     assert!(r2.success);
     assert_eq!(r2.stdout.trim(), "missing");
@@ -137,21 +135,11 @@ fn restart_session_clears_memory() {
     };
 
     let define = chunk(CodeLanguage::Python, "survives = 'no'");
-    assert!(
-        manager
-            .execute("py-restart", &define)
-            .expect("execute")
-            .success
-    );
+    assert!(manager.execute("py-restart", &define).expect("execute").success);
 
-    manager
-        .restart_session("py-restart")
-        .expect("restart session");
+    manager.restart_session("py-restart").expect("restart session");
 
-    let probe = chunk(
-        CodeLanguage::Python,
-        "print('survives' if 'survives' in globals() else 'cleared')",
-    );
+    let probe = chunk(CodeLanguage::Python, "print('survives' if 'survives' in globals() else 'cleared')");
     let result = manager.execute("py-restart", &probe).expect("execute");
     assert!(result.success);
     assert_eq!(result.stdout.trim(), "cleared");
@@ -173,24 +161,13 @@ fn a_session_keeps_its_language() {
     };
 
     let first = chunk(CodeLanguage::Python, "x = 1");
-    assert!(
-        manager
-            .execute("lang-guard", &first)
-            .expect("execute")
-            .success
-    );
+    assert!(manager.execute("lang-guard", &first).expect("execute").success);
 
     let r_chunk = chunk(CodeLanguage::R, "x <- 1");
-    let err = manager
-        .execute("lang-guard", &r_chunk)
-        .expect_err("should reject language mismatch");
+    let err = manager.execute("lang-guard", &r_chunk).expect_err("should reject language mismatch");
 
     match err {
-        KernelError::SessionLanguageMismatch {
-            session_id,
-            existing,
-            requested,
-        } => {
+        KernelError::SessionLanguageMismatch { session_id, existing, requested } => {
             assert_eq!(session_id, "lang-guard");
             assert_eq!(existing, CodeLanguage::Python);
             assert_eq!(requested, CodeLanguage::R);
@@ -228,24 +205,14 @@ fn idle_session_reaped_on_subsequent_execute_request() {
     manager.set_idle_timeout(Duration::from_millis(50));
 
     let first = chunk(CodeLanguage::Python, "cached_var = 123");
-    assert!(
-        manager
-            .execute("idle-expiry-target", &first)
-            .expect("execute")
-            .success
-    );
+    assert!(manager.execute("idle-expiry-target", &first).expect("execute").success);
 
     std::thread::sleep(Duration::from_millis(100));
 
     // Calling execute on the exact same session_id after timeout should reap the expired daemon
     // and start a fresh one, meaning cached_var is no longer defined.
-    let second = chunk(
-        CodeLanguage::Python,
-        "print('found' if 'cached_var' in globals() else 'expired')",
-    );
-    let result = manager
-        .execute("idle-expiry-target", &second)
-        .expect("execute");
+    let second = chunk(CodeLanguage::Python, "print('found' if 'cached_var' in globals() else 'expired')");
+    let result = manager.execute("idle-expiry-target", &second).expect("execute");
     assert!(result.success);
     assert_eq!(result.stdout.trim(), "expired");
 
@@ -281,51 +248,35 @@ fn session_timeout_kills_the_daemon() {
     assert!(res_warm.success);
     assert_eq!(res_warm.stdout.trim(), "warm");
 
-    let marker_dir = std::env::temp_dir().join(format!(
-        "wordcraft-descendant-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or(0)
-    ));
-    fs::create_dir(&marker_dir).expect("create descendant dir");
-    let marker = marker_dir.join("alive.marker");
-    let child_script = marker_dir.join("child.py");
-    let marker_literal =
-        serde_json::to_string(&marker.to_string_lossy()).expect("encode marker path");
+    let descendant_dir = TempDirGuard::new("wordcraft-descendant");
+    let marker = descendant_dir.path().join("alive.marker");
+    let ready = descendant_dir.path().join("ready.marker");
+    let child_script = descendant_dir.path().join("child.py");
+    let ready_literal = serde_json::to_string(&ready.to_string_lossy()).expect("encode ready path");
+    let marker_literal = serde_json::to_string(&marker.to_string_lossy()).expect("encode marker path");
     fs::write(
         &child_script,
-        format!("import time\ntime.sleep(0.8)\nopen({marker_literal}, 'w').write('alive')\n"),
+        format!("import time\nopen({ready_literal}, 'w').write('ready')\ntime.sleep(0.8)\nopen({marker_literal}, 'w').write('alive')\n"),
     )
     .expect("write descendant script");
-    let script_literal =
-        serde_json::to_string(&child_script.to_string_lossy()).expect("encode script path");
+    let script_literal = serde_json::to_string(&child_script.to_string_lossy()).expect("encode script path");
 
     let hang = ExecutionRequest::new(
         CodeLanguage::Python,
         format!(
-            "import subprocess, sys, time\nsubprocess.Popen([sys.executable, {script_literal}])\nprint('started', flush=True)\ntime.sleep(10)"
+            "import os, subprocess, sys, time\nsubprocess.Popen([sys.executable, {script_literal}])\nready = {ready_literal}\nfor _ in range(500):\n    if os.path.exists(ready):\n        break\n    time.sleep(0.01)\nprint('started', flush=True)\ntime.sleep(10)"
         ),
     )
     .with_timeout(300);
-    let result = manager
-        .execute("py-timeout", &hang)
-        .expect("execution result");
+    let result = manager.execute("py-timeout", &hang).expect("execution result");
     assert!(result.timed_out);
     assert!(!result.success);
-    assert!(
-        result.stdout.contains("started"),
-        "stdout should capture output before timeout: {:?}",
-        result.stdout
-    );
+    assert!(result.stdout.contains("started"), "stdout should capture output before timeout: {:?}", result.stdout);
+    assert!(ready.exists(), "the descendant must report readiness before cleanup is measured");
     assert!(!manager.contains("py-timeout"));
 
     std::thread::sleep(Duration::from_millis(1_200));
-    assert!(
-        !marker.exists(),
-        "a timed-out chunk must reap descendants in its process group"
-    );
+    assert!(!marker.exists(), "a timed-out chunk must reap descendants in its process group");
 
     let next = chunk(CodeLanguage::Python, "print('recovered')");
     let r2 = manager.execute("py-timeout", &next).expect("execute next");
@@ -333,7 +284,6 @@ fn session_timeout_kills_the_daemon() {
     assert_eq!(r2.stdout.trim(), "recovered");
 
     manager.close_session("py-timeout");
-    let _ = fs::remove_dir_all(&marker_dir);
 }
 
 #[test]
@@ -344,20 +294,14 @@ fn a_failed_chunk_leaves_the_session_running() {
 
     // Step 1: Assign a marker before raising an error
     let define = chunk(CodeLanguage::Python, "marker = 9876");
-    let r1 = manager
-        .execute("py-error", &define)
-        .expect("execute chunk 1");
+    let r1 = manager.execute("py-error", &define).expect("execute chunk 1");
     assert!(r1.success);
 
     // Step 2: Failed chunk raises an error
     let bad = chunk(CodeLanguage::Python, "raise RuntimeError('boom')");
     let r2 = manager.execute("py-error", &bad).expect("execute chunk 2");
     assert!(!r2.success);
-    assert!(
-        r2.stderr.contains("RuntimeError"),
-        "stderr should mention the exception: {}",
-        r2.stderr
-    );
+    assert!(r2.stderr.contains("RuntimeError"), "stderr should mention the exception: {}", r2.stderr);
 
     // Step 3: Verify the session was NOT killed and pre-existing variables persist
     let next = chunk(CodeLanguage::Python, "print(f'marker is {marker}')");
@@ -376,26 +320,17 @@ fn r_session_reports_errors_without_dying() {
 
     // Step 1: Assign a marker before raising an error
     let define = chunk(CodeLanguage::R, "marker <- 54321");
-    let r1 = manager
-        .execute("r-error", &define)
-        .expect("execute chunk 1");
+    let r1 = manager.execute("r-error", &define).expect("execute chunk 1");
     assert!(r1.success);
 
     // Step 2: Failed chunk stops with an error
     let bad = chunk(CodeLanguage::R, "stop(\"deliberate failure\")");
     let r2 = manager.execute("r-error", &bad).expect("execute chunk 2");
     assert!(!r2.success);
-    assert!(
-        r2.stderr.contains("deliberate failure"),
-        "stderr should mention the error: {}",
-        r2.stderr
-    );
+    assert!(r2.stderr.contains("deliberate failure"), "stderr should mention the error: {}", r2.stderr);
 
     // Step 3: Verify variables assigned before the error are still accessible
-    let probe = chunk(
-        CodeLanguage::R,
-        "cat(\"marker is \", marker, \"\\n\", sep = \"\")",
-    );
+    let probe = chunk(CodeLanguage::R, "cat(\"marker is \", marker, \"\\n\", sep = \"\")");
     let r3 = manager.execute("r-error", &probe).expect("execute chunk 3");
     assert!(r3.success, "stderr: {}", r3.stderr);
     assert_eq!(r3.stdout.trim(), "marker is 54321");
@@ -414,9 +349,7 @@ import sys
 print("standard output line")
 sys.stderr.write("standard error line\n")
 "#;
-    let result = manager
-        .execute("streams", &chunk(CodeLanguage::Python, code))
-        .expect("execute");
+    let result = manager.execute("streams", &chunk(CodeLanguage::Python, code)).expect("execute");
     assert!(result.success);
     assert_eq!(result.stdout.trim(), "standard output line");
     assert_eq!(result.stderr.trim(), "standard error line");
@@ -470,12 +403,7 @@ fn close_session_frees_the_process() {
     };
 
     let c = chunk(CodeLanguage::Python, "x = 1");
-    assert!(
-        manager
-            .execute("close-target", &c)
-            .expect("execute")
-            .success
-    );
+    assert!(manager.execute("close-target", &c).expect("execute").success);
     assert!(manager.contains("close-target"));
 
     assert!(manager.close_session("close-target"));
@@ -491,37 +419,18 @@ fn a_chunk_changes_the_working_directory_for_later_chunks() {
         return;
     };
 
-    struct TempDirGuard(PathBuf);
-    impl Drop for TempDirGuard {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    let sub = TempDirGuard::new("wc-test-cwd");
 
-    let pid = std::process::id();
-    let rand_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let sub = std::env::temp_dir().join(format!("wc-test-cwd-{pid}-{rand_id}"));
-    fs::create_dir_all(&sub).expect("create dir");
-    let _guard = TempDirGuard(sub.clone());
-
-    let move_req =
-        chunk(CodeLanguage::Python, "import os; print(os.getcwd())").with_working_dir(&sub);
-    let r1 = manager
-        .execute("py-cwd", &move_req)
-        .expect("execute move chunk");
+    let move_req = chunk(CodeLanguage::Python, "import os; print(os.getcwd())").with_working_dir(sub.path());
+    let r1 = manager.execute("py-cwd", &move_req).expect("execute move chunk");
     assert!(r1.success, "stderr: {}", r1.stderr);
 
     let stay_req = chunk(CodeLanguage::Python, "import os; print(os.getcwd())");
-    let r2 = manager
-        .execute("py-cwd", &stay_req)
-        .expect("execute stay chunk");
+    let r2 = manager.execute("py-cwd", &stay_req).expect("execute stay chunk");
     assert!(r2.success, "stderr: {}", r2.stderr);
 
     let actual_path = PathBuf::from(r2.stdout.trim());
-    let expected_canon = sub.canonicalize().unwrap_or_else(|_| sub.clone());
+    let expected_canon = sub.path().canonicalize().unwrap_or_else(|_| sub.path().to_path_buf());
     let actual_canon = actual_path.canonicalize().unwrap_or(actual_path);
 
     let normalize = |p: &Path| {
@@ -539,29 +448,15 @@ fn session_rejects_a_regular_file_as_working_directory() {
         return;
     };
 
-    let file_path = std::env::temp_dir().join(format!(
-        "wordcraft-session-file-{}-{}.txt",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or(0)
-    ));
+    let fixture = TempDirGuard::new("wordcraft-session-file");
+    let file_path = fixture.path().join("probe.txt");
     fs::write(&file_path, b"not a directory").expect("write probe file");
 
-    let request =
-        chunk(CodeLanguage::Python, "print('should not run')").with_working_dir(&file_path);
+    let request = chunk(CodeLanguage::Python, "print('should not run')").with_working_dir(&file_path);
     let result = manager.execute("file-cwd", &request);
-    let _ = fs::remove_file(&file_path);
 
-    assert!(
-        result.is_err(),
-        "a regular file must not become a working dir"
-    );
-    assert!(
-        !manager.contains("file-cwd"),
-        "the invalid request must not occupy a session"
-    );
+    assert!(result.is_err(), "a regular file must not become a working dir");
+    assert!(!manager.contains("file-cwd"), "the invalid request must not occupy a session");
 }
 
 #[test]
@@ -573,38 +468,20 @@ fn python_session_uses_request_python_path() {
     let module_dir = std::env::temp_dir().join(format!(
         "wordcraft-python-path-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or(0)
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|elapsed| elapsed.as_nanos()).unwrap_or(0)
     ));
     fs::create_dir(&module_dir).expect("create module dir");
-    fs::write(
-        module_dir.join("wc_session_probe.py"),
-        b"VALUE = 'from-request-path'\n",
-    )
-    .expect("write probe module");
+    fs::write(module_dir.join("wc_session_probe.py"), b"VALUE = 'from-request-path'\n").expect("write probe module");
 
-    let request = chunk(
-        CodeLanguage::Python,
-        "import wc_session_probe; print(wc_session_probe.VALUE)",
-    )
-    .with_python_path(&module_dir);
-    let result = manager
-        .execute("py-path", &request)
-        .expect("execute with python_path");
+    let request = chunk(CodeLanguage::Python, "import wc_session_probe; print(wc_session_probe.VALUE)").with_python_path(&module_dir);
+    let result = manager.execute("py-path", &request).expect("execute with python_path");
     assert!(result.success, "stderr: {}", result.stderr);
     assert_eq!(result.stdout.trim(), "from-request-path");
 
     // Request-scoped: the directory must not stay on sys.path for later chunks.
-    let probe_code = format!(
-        "import sys; print({} in sys.path)",
-        serde_json::to_string(&module_dir.to_string_lossy()).expect("encode module path")
-    );
+    let probe_code = format!("import sys; print({} in sys.path)", serde_json::to_string(&module_dir.to_string_lossy()).expect("encode module path"));
     let probe = chunk(CodeLanguage::Python, &probe_code);
-    let probe_result = manager
-        .execute("py-path", &probe)
-        .expect("execute path probe");
+    let probe_result = manager.execute("py-path", &probe).expect("execute path probe");
     assert!(probe_result.success, "stderr: {}", probe_result.stderr);
     assert_eq!(probe_result.stdout.trim(), "False");
 
@@ -619,25 +496,17 @@ fn session_preserved_on_invalid_unsent_request() {
     };
 
     let init = chunk(CodeLanguage::Python, "my_val = 'important_data'");
-    assert!(
-        manager
-            .execute("preserve-test", &init)
-            .expect("execute")
-            .success
-    );
+    assert!(manager.execute("preserve-test", &init).expect("execute").success);
 
     // Request with invalid working directory containing line break
-    let bad_req = chunk(CodeLanguage::Python, "print('should not run')")
-        .with_working_dir(PathBuf::from("dir\nwith\nnewline"));
+    let bad_req = chunk(CodeLanguage::Python, "print('should not run')").with_working_dir(PathBuf::from("dir\nwith\nnewline"));
 
     let err = manager.execute("preserve-test", &bad_req);
     assert!(err.is_err());
 
     // The healthy session must still be present with its variables intact
     let probe = chunk(CodeLanguage::Python, "print(my_val)");
-    let res = manager
-        .execute("preserve-test", &probe)
-        .expect("execute probe");
+    let res = manager.execute("preserve-test", &probe).expect("execute probe");
     assert!(res.success);
     assert_eq!(res.stdout.trim(), "important_data");
 
@@ -656,16 +525,10 @@ fn session_temp_dir_has_restricted_permissions() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let temp_dir = manager
-            .temp_dir_for_test("perm-test")
-            .expect("session temp dir");
+        let temp_dir = manager.temp_dir_for_test("perm-test").expect("session temp dir");
         let metadata = fs::metadata(temp_dir).expect("metadata");
         let mode = metadata.permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o700,
-            "session directory must have 0700 permissions, got 0{:o}",
-            mode
-        );
+        assert_eq!(mode, 0o700, "session directory must have 0700 permissions, got 0{:o}", mode);
     }
 
     manager.close_session("perm-test");
@@ -686,9 +549,7 @@ END 1
 print("received:", len(msg) > 0)
 "#;
     let req = chunk(CodeLanguage::Python, tricky_code);
-    let res = manager
-        .execute("sentinel-test", &req)
-        .expect("execute tricky code");
+    let res = manager.execute("sentinel-test", &req).expect("execute tricky code");
     assert!(res.success, "stderr: {}", res.stderr);
     assert_eq!(res.stdout.trim(), "received: True");
 
@@ -707,9 +568,7 @@ import subprocess, sys
 subprocess.run([sys.executable, "-c", "import sys; sys.stdout.write('sub_output_no_newline')"])
 "#;
     let req = chunk(CodeLanguage::Python, code);
-    let res = manager
-        .execute("subproc-test", &req)
-        .expect("execute subprocess");
+    let res = manager.execute("subproc-test", &req).expect("execute subprocess");
     assert!(res.success, "stderr: {}", res.stderr);
     assert_eq!(res.stdout.trim(), "sub_output_no_newline");
 
@@ -725,13 +584,10 @@ fn python_session_captures_plots_between_chunks() {
         return;
     };
 
-    let draw = ExecutionRequest::new(
-        CodeLanguage::Python,
-        "import matplotlib.pyplot as plt\nplt.figure()\nplt.plot([1, 2, 3], [4, 5, 6])",
-    )
-    .with_plot_capture(true)
-    .with_plot_format(PlotFormat::Png)
-    .with_timeout(10_000);
+    let draw = ExecutionRequest::new(CodeLanguage::Python, "import matplotlib.pyplot as plt\nplt.figure()\nplt.plot([1, 2, 3], [4, 5, 6])")
+        .with_plot_capture(true)
+        .with_plot_format(PlotFormat::Png)
+        .with_timeout(10_000);
 
     let result = manager.execute("py-plot", &draw).expect("execute draw");
     assert!(result.success, "stderr: {}", result.stderr);
@@ -754,17 +610,12 @@ fn python_text_chunk_does_not_reemit_old_figure() {
     };
 
     // Chunk 1: Create a plot
-    let draw = ExecutionRequest::new(
-        CodeLanguage::Python,
-        "import matplotlib.pyplot as plt\nplt.figure()\nplt.plot([1, 2], [3, 4])",
-    )
-    .with_plot_capture(true)
-    .with_plot_format(PlotFormat::Png)
-    .with_timeout(10_000);
+    let draw = ExecutionRequest::new(CodeLanguage::Python, "import matplotlib.pyplot as plt\nplt.figure()\nplt.plot([1, 2], [3, 4])")
+        .with_plot_capture(true)
+        .with_plot_format(PlotFormat::Png)
+        .with_timeout(10_000);
 
-    let r1 = manager
-        .execute("py-no-reemit", &draw)
-        .expect("execute draw");
+    let r1 = manager.execute("py-no-reemit", &draw).expect("execute draw");
     assert!(r1.success);
     assert!(r1.plot_png.is_some(), "chunk 1 should emit plot");
 
@@ -774,15 +625,10 @@ fn python_text_chunk_does_not_reemit_old_figure() {
         .with_plot_format(PlotFormat::Png)
         .with_timeout(10_000);
 
-    let r2 = manager
-        .execute("py-no-reemit", &text)
-        .expect("execute text");
+    let r2 = manager.execute("py-no-reemit", &text).expect("execute text");
     assert!(r2.success);
     assert_eq!(r2.stdout.trim(), "pure text here");
-    assert!(
-        r2.plot_png.is_none(),
-        "text chunk must not re-emit figure from earlier chunk"
-    );
+    assert!(r2.plot_png.is_none(), "text chunk must not re-emit figure from earlier chunk");
 
     manager.close_session("py-no-reemit");
 }
@@ -796,13 +642,10 @@ fn python_session_captures_png_and_svg() {
         return;
     };
 
-    let draw = ExecutionRequest::new(
-        CodeLanguage::Python,
-        "import matplotlib.pyplot as plt\nplt.figure()\nplt.plot([0, 1], [0, 1])",
-    )
-    .with_plot_capture(true)
-    .with_plot_format(PlotFormat::Both)
-    .with_timeout(10_000);
+    let draw = ExecutionRequest::new(CodeLanguage::Python, "import matplotlib.pyplot as plt\nplt.figure()\nplt.plot([0, 1], [0, 1])")
+        .with_plot_capture(true)
+        .with_plot_format(PlotFormat::Both)
+        .with_timeout(10_000);
 
     let result = manager.execute("py-dual", &draw).expect("execute draw");
     assert!(result.success, "stderr: {}", result.stderr);
@@ -825,10 +668,8 @@ fn r_session_captures_a_plot() {
         return;
     };
 
-    let draw = ExecutionRequest::new(CodeLanguage::R, "plot(1:5, 1:5)")
-        .with_plot_capture(true)
-        .with_plot_format(PlotFormat::Png)
-        .with_timeout(10_000);
+    let draw =
+        ExecutionRequest::new(CodeLanguage::R, "plot(1:5, 1:5)").with_plot_capture(true).with_plot_format(PlotFormat::Png).with_timeout(10_000);
 
     let result = manager.execute("r-plot", &draw).expect("execute draw");
     assert!(result.success, "stderr: {}", result.stderr);
@@ -863,11 +704,7 @@ fn r_dual_plot_captures_both_png_and_svg_and_closes_devices() {
     assert!(svg.trim_end().ends_with("</svg>"));
 
     // Verify devices were cleanly closed by running a probe chunk with capture disabled
-    let probe = chunk(
-        CodeLanguage::R,
-        "cat('open devs:', length(dev.list()), '\\n')",
-    )
-    .with_plot_capture(false);
+    let probe = chunk(CodeLanguage::R, "cat('open devs:', length(dev.list()), '\\n')").with_plot_capture(false);
     let r_probe = manager.execute("r-dual", &probe).expect("execute probe");
     assert!(r_probe.success);
     assert_eq!(r_probe.stdout.trim(), "open devs: 0");
@@ -889,9 +726,7 @@ out_path <- "/tmp/forbidden"
 cat("user status is ", status, "\n", sep = "")
 "#;
     let req = chunk(CodeLanguage::R, code);
-    let res = manager
-        .execute("r-collision", &req)
-        .expect("execute collision");
+    let res = manager.execute("r-collision", &req).expect("execute collision");
     assert!(res.success, "stderr: {}", res.stderr);
     assert_eq!(res.stdout.trim(), "user status is ready");
 
@@ -914,18 +749,14 @@ class Person:
 p = Person("Ada")
 data = pickle.dumps(p)
 "#;
-    let res1 = manager
-        .execute("py-pickle", &chunk(CodeLanguage::Python, define_class))
-        .expect("define class");
+    let res1 = manager.execute("py-pickle", &chunk(CodeLanguage::Python, define_class)).expect("define class");
     assert!(res1.success, "stderr: {}", res1.stderr);
 
     let unpickle_code = r#"
 p2 = pickle.loads(data)
 print(f"unpickled {p2.name}")
 "#;
-    let res2 = manager
-        .execute("py-pickle", &chunk(CodeLanguage::Python, unpickle_code))
-        .expect("unpickle");
+    let res2 = manager.execute("py-pickle", &chunk(CodeLanguage::Python, unpickle_code)).expect("unpickle");
     assert!(res2.success, "stderr: {}", res2.stderr);
     assert_eq!(res2.stdout.trim(), "unpickled Ada");
 
@@ -960,20 +791,14 @@ fig.canvas.draw()
     let req2 = ExecutionRequest::new(CodeLanguage::Python, code2).with_plot_capture(true);
     let res2 = manager.execute("py-inplace", &req2).expect("chunk 2");
     assert!(res2.success, "stderr: {}", res2.stderr);
-    assert!(
-        res2.plot_png.is_some(),
-        "modified figure should be re-emitted"
-    );
+    assert!(res2.plot_png.is_some(), "modified figure should be re-emitted");
 
     // Third chunk does NOT modify anything
     let code3 = "x = 42\nprint(x)";
     let req3 = ExecutionRequest::new(CodeLanguage::Python, code3).with_plot_capture(true);
     let res3 = manager.execute("py-inplace", &req3).expect("chunk 3");
     assert!(res3.success, "stderr: {}", res3.stderr);
-    assert!(
-        res3.plot_png.is_none(),
-        "unmodified figure should not be re-emitted"
-    );
+    assert!(res3.plot_png.is_none(), "unmodified figure should not be re-emitted");
 
     manager.close_session("py-inplace");
 }
@@ -997,12 +822,8 @@ def on_draw(event):
     print("plot callback stderr", file=sys.stderr)
 fig.canvas.mpl_connect("draw_event", on_draw)
 "#;
-    let req = ExecutionRequest::new(CodeLanguage::Python, code)
-        .with_plot_capture(true)
-        .with_plot_format(PlotFormat::Png);
-    let result = manager
-        .execute("py-plot-callback", &req)
-        .expect("execute plot");
+    let req = ExecutionRequest::new(CodeLanguage::Python, code).with_plot_capture(true).with_plot_format(PlotFormat::Png);
+    let result = manager.execute("py-plot-callback", &req).expect("execute plot");
 
     assert!(result.success, "stderr: {}", result.stderr);
     assert!(result.plot_png.is_some(), "plot should be captured");
@@ -1025,9 +846,7 @@ sink <- function(...) stop("sabotaged sink")
 .wc_driver <- "wrecked"
 base::print("step 1 complete")
 "#;
-    let res1 = manager
-        .execute("r-shadow", &chunk(CodeLanguage::R, code1))
-        .expect("step 1");
+    let res1 = manager.execute("r-shadow", &chunk(CodeLanguage::R, code1)).expect("step 1");
     assert!(res1.success, "stderr: {}", res1.stderr);
     assert!(res1.stdout.contains("step 1 complete"));
 
@@ -1035,9 +854,7 @@ base::print("step 1 complete")
 rm(list = base::ls(all.names = TRUE))
 base::print("still alive")
 "#;
-    let res2 = manager
-        .execute("r-shadow", &chunk(CodeLanguage::R, code2))
-        .expect("step 2");
+    let res2 = manager.execute("r-shadow", &chunk(CodeLanguage::R, code2)).expect("step 2");
     assert!(res2.success, "stderr: {}", res2.stderr);
     assert!(res2.stdout.contains("still alive"));
 
@@ -1056,40 +873,20 @@ cat("before-subprocess\n")
 system("printf 'partial-line-output'")
 cat("\nafter-subprocess\n")
 "#;
-    let res = manager
-        .execute("r-subp", &chunk(CodeLanguage::R, code))
-        .expect("exec subp");
+    let res = manager.execute("r-subp", &chunk(CodeLanguage::R, code)).expect("exec subp");
     assert!(res.success, "stderr: {}", res.stderr);
-    assert!(
-        res.stdout.contains("partial-line-output"),
-        "stdout should contain partial-line-output, got: {:?}",
-        res.stdout
-    );
+    assert!(res.stdout.contains("partial-line-output"), "stdout should contain partial-line-output, got: {:?}", res.stdout);
     let before = res.stdout.find("before-subprocess").expect("before output");
-    let subprocess = res
-        .stdout
-        .find("partial-line-output")
-        .expect("subprocess output");
+    let subprocess = res.stdout.find("partial-line-output").expect("subprocess output");
     let after = res.stdout.find("after-subprocess").expect("after output");
-    assert!(
-        before < subprocess && subprocess < after,
-        "stdout order was: {:?}",
-        res.stdout
-    );
+    assert!(before < subprocess && subprocess < after, "stdout order was: {:?}", res.stdout);
 
-    let binary = manager
-        .execute(
-            "r-subp",
-            &chunk(CodeLanguage::R, r#"system("printf '\\377'")"#),
-        )
-        .expect("exec non-UTF-8 subp");
+    let binary = manager.execute("r-subp", &chunk(CodeLanguage::R, r#"system("printf '\\377'")"#)).expect("exec non-UTF-8 subp");
     assert!(binary.success, "stderr: {}", binary.stderr);
     assert!(binary.stdout.contains('\u{fffd}'));
 
     // Follow-up chunk confirms session is healthy and responsive
-    let res2 = manager
-        .execute("r-subp", &chunk(CodeLanguage::R, "cat('ok\n')"))
-        .expect("exec follow-up");
+    let res2 = manager.execute("r-subp", &chunk(CodeLanguage::R, "cat('ok\n')")).expect("exec follow-up");
     assert!(res2.success, "stderr: {}", res2.stderr);
     assert_eq!(res2.stdout.trim(), "ok");
 
@@ -1104,15 +901,9 @@ fn r_subprocess_stderr_is_captured_in_the_chunk_result() {
     };
 
     let code = r#"system("echo subprocess-diagnostic >&2")"#;
-    let res = manager
-        .execute("r-subp-stderr", &chunk(CodeLanguage::R, code))
-        .expect("exec subprocess stderr");
+    let res = manager.execute("r-subp-stderr", &chunk(CodeLanguage::R, code)).expect("exec subprocess stderr");
     assert!(res.success, "stderr: {}", res.stderr);
-    assert!(
-        res.stderr.contains("subprocess-diagnostic"),
-        "chunk stderr must include the subprocess diagnostic, got: {:?}",
-        res.stderr
-    );
+    assert!(res.stderr.contains("subprocess-diagnostic"), "chunk stderr must include the subprocess diagnostic, got: {:?}", res.stderr);
 
     manager.close_session("r-subp-stderr");
 }
@@ -1124,25 +915,27 @@ fn r_output_written_after_a_chunk_does_not_leak_into_the_next_chunk() {
         return;
     };
 
-    let code = r#"system("sh -c 'sleep 0.4; echo late-output' &")"#;
-    let first = manager
-        .execute("r-late-output", &chunk(CodeLanguage::R, code))
-        .expect("exec background writer");
-    assert!(first.success, "stderr: {}", first.stderr);
-    assert!(
-        !first.stdout.contains("late-output"),
-        "the spawning chunk must not report the background output: {:?}",
-        first.stdout
+    let fixture = TempDirGuard::new("wc-r-late-output");
+    let release = fixture.path().join("release");
+    let done = fixture.path().join("done");
+    let release_literal = serde_json::to_string(&release.to_string_lossy()).expect("encode release path");
+    let done_literal = serde_json::to_string(&done.to_string_lossy()).expect("encode done path");
+    let code = format!(
+        "release <- {release_literal}\ndone <- {done_literal}\nsystem(paste0(\"sh -c 'while [ ! -f \\\"\", release, \"\\\" ]; do sleep 0.01; done; echo late-output; : > \\\"\", done, \"\\\"' &\"))"
     );
 
-    std::thread::sleep(Duration::from_millis(700));
+    let first = manager.execute("r-late-output", &chunk(CodeLanguage::R, &code)).expect("exec background writer");
+    assert!(first.success, "stderr: {}", first.stderr);
+    assert!(!first.stdout.contains("late-output"), "the spawning chunk must not report the background output: {:?}", first.stdout);
 
-    let second = manager
-        .execute(
-            "r-late-output",
-            &chunk(CodeLanguage::R, "cat('clean-chunk\\n')"),
-        )
-        .expect("exec next chunk");
+    fs::write(&release, b"go").expect("release background writer");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(done.exists(), "the background writer must emit while the session is idle");
+
+    let second = manager.execute("r-late-output", &chunk(CodeLanguage::R, "cat('clean-chunk\\n')")).expect("exec next chunk");
     assert!(second.success, "stderr: {}", second.stderr);
     assert_eq!(second.stdout.trim(), "clean-chunk");
 
@@ -1155,11 +948,8 @@ fn r_large_output_is_truncated_and_bounded() {
         return;
     };
 
-    let request = ExecutionRequest::new(CodeLanguage::R, "cat(strrep('x', 11 * 1024 * 1024))")
-        .with_timeout(30_000);
-    let res = manager
-        .execute("r-large-output", &request)
-        .expect("exec large output");
+    let request = ExecutionRequest::new(CodeLanguage::R, "cat(strrep('x', 11 * 1024 * 1024))").with_timeout(30_000);
+    let res = manager.execute("r-large-output", &request).expect("exec large output");
     assert!(res.success, "stderr: {}", res.stderr);
     assert!(res.output_truncated, "expected output_truncated to be set");
     assert!(
@@ -1170,6 +960,22 @@ fn r_large_output_is_truncated_and_bounded() {
     );
 
     manager.close_session("r-large-output");
+}
+
+#[test]
+fn r_final_output_before_end_is_not_lost() {
+    let Some(mut manager) = manager_for(CodeLanguage::R) else {
+        return;
+    };
+
+    for index in 0..20 {
+        let expected = format!("final-{index}");
+        let res = manager.execute("r-drain", &chunk(CodeLanguage::R, &format!("cat('{expected}')"))).expect("execute chunk with final output");
+        assert!(res.success, "stderr: {}", res.stderr);
+        assert_eq!(res.stdout, expected, "final output of iteration {index} was discarded after END");
+    }
+
+    manager.close_session("r-drain");
 }
 
 #[test]
@@ -1191,10 +997,7 @@ plot(5:1)
     let req = ExecutionRequest::new(CodeLanguage::R, code).with_plot_capture(true);
     let res = manager.execute("r-devoff-pdf", &req).expect("exec");
     assert!(res.success, "stderr: {}", res.stderr);
-    assert!(
-        res.plot_png.is_some(),
-        "first chunk must exercise driver's PNG capture device"
-    );
+    assert!(res.plot_png.is_some(), "first chunk must exercise driver's PNG capture device");
 
     // Follow-up chunk verifies the replacement device was kept open and intact
     let check_code = r#"
@@ -1203,9 +1006,7 @@ invisible(dev.off(saved_dev))
 cat("device still open: ", is_open, "\n", sep = "")
 "#;
     let req2 = ExecutionRequest::new(CodeLanguage::R, check_code).with_plot_capture(false);
-    let res2 = manager
-        .execute("r-devoff-pdf", &req2)
-        .expect("exec follow-up");
+    let res2 = manager.execute("r-devoff-pdf", &req2).expect("exec follow-up");
     assert!(res2.success, "stderr: {}", res2.stderr);
     assert_eq!(res2.stdout.trim(), "device still open: TRUE");
 
@@ -1222,14 +1023,9 @@ fn r_session_handles_unicode_utf8_code_cleanly() {
 msg <- "Olá mundo! Acentuação e emojis: 🌍 café"
 cat(msg, "\n", sep = "")
 "#;
-    let res = manager
-        .execute("r-utf8", &chunk(CodeLanguage::R, code))
-        .expect("exec utf8");
+    let res = manager.execute("r-utf8", &chunk(CodeLanguage::R, code)).expect("exec utf8");
     assert!(res.success, "stderr: {}", res.stderr);
-    assert!(
-        res.stdout
-            .contains("Olá mundo! Acentuação e emojis: 🌍 café")
-    );
+    assert!(res.stdout.contains("Olá mundo! Acentuação e emojis: 🌍 café"));
 
     manager.close_session("r-utf8");
 }
@@ -1251,11 +1047,7 @@ fn session_rejects_non_utf8_working_directory_gracefully() {
     let res = manager.execute("py-utf8", &req);
     assert!(res.is_err());
     let err_str = res.expect_err("should reject").to_string();
-    assert!(
-        err_str.contains("valid UTF-8"),
-        "error should state valid UTF-8 requirement: {}",
-        err_str
-    );
+    assert!(err_str.contains("valid UTF-8"), "error should state valid UTF-8 requirement: {}", err_str);
 }
 
 #[test]
@@ -1265,21 +1057,13 @@ fn r_session_recovers_after_close_all_connections() {
     };
 
     let code1 = "val <- 42\ncloseAllConnections()\n";
-    let res1 = manager
-        .execute("r-close-all", &chunk(CodeLanguage::R, code1))
-        .expect("chunk 1");
+    let res1 = manager.execute("r-close-all", &chunk(CodeLanguage::R, code1)).expect("chunk 1");
     assert!(res1.success, "stderr: {}", res1.stderr);
 
     let code2 = "val * 2\n";
-    let res2 = manager
-        .execute("r-close-all", &chunk(CodeLanguage::R, code2))
-        .expect("chunk 2");
+    let res2 = manager.execute("r-close-all", &chunk(CodeLanguage::R, code2)).expect("chunk 2");
     assert!(res2.success, "stderr: {}", res2.stderr);
-    assert!(
-        res2.stdout.contains("84"),
-        "stdout should contain visible evaluation of 84: {:?}",
-        res2.stdout
-    );
+    assert!(res2.stdout.contains("84"), "stdout should contain visible evaluation of 84: {:?}", res2.stdout);
 
     manager.close_session("r-close-all");
 }
@@ -1323,10 +1107,7 @@ fn large_output_sets_truncated_flag_and_bounds_memory() {
     };
 
     // Print > 10 MiB of text
-    let req = ExecutionRequest::new(
-        CodeLanguage::Python,
-        "import sys\nsys.stdout.write('X' * (11 * 1024 * 1024))\nsys.stdout.flush()",
-    );
+    let req = ExecutionRequest::new(CodeLanguage::Python, "import sys\nsys.stdout.write('X' * (11 * 1024 * 1024))\nsys.stdout.flush()");
     let res = manager.execute("large-out", &req).expect("large out");
     assert!(res.success, "stderr: {}", res.stderr);
     assert!(res.output_truncated, "expected output_truncated to be true");
@@ -1336,19 +1117,13 @@ fn large_output_sets_truncated_flag_and_bounds_memory() {
         res.stdout.len(),
         crate::session::MAX_STREAM_BYTES
     );
+    assert!(!res.stdout.is_empty(), "truncation must retain the prefix, not discard the stream");
+    assert!(res.stdout.bytes().all(|byte| byte == b'X'), "the retained prefix must be the original ASCII output");
 
-    let invalid_utf8 = ExecutionRequest::new(
-        CodeLanguage::Python,
-        "import sys\nsys.stdout.buffer.write(b'\\xff' * (5 * 1024 * 1024))",
-    );
-    let invalid_result = manager
-        .execute("large-out", &invalid_utf8)
-        .expect("invalid UTF-8 output");
+    let invalid_utf8 = ExecutionRequest::new(CodeLanguage::Python, "import sys\nsys.stdout.buffer.write(b'\\xff' * (5 * 1024 * 1024))");
+    let invalid_result = manager.execute("large-out", &invalid_utf8).expect("invalid UTF-8 output");
     assert!(invalid_result.success, "stderr: {}", invalid_result.stderr);
-    assert!(
-        invalid_result.output_truncated,
-        "lossy UTF-8 expansion must be reported as truncation"
-    );
+    assert!(invalid_result.output_truncated, "lossy UTF-8 expansion must be reported as truncation");
     assert!(invalid_result.stdout.len() <= crate::session::MAX_STREAM_BYTES);
 
     // Follow-up execution should work cleanly
@@ -1358,6 +1133,105 @@ fn large_output_sets_truncated_flag_and_bounds_memory() {
     assert_eq!(res2.stdout.trim(), "clean");
 
     manager.close_session("large-out");
+}
+
+#[test]
+fn python_timeout_retains_truncated_output() {
+    let Some(mut manager) = manager_for(CodeLanguage::Python) else {
+        return;
+    };
+
+    let warm = chunk(CodeLanguage::Python, "print('warm')");
+    assert!(manager.execute("py-trunc-timeout", &warm).expect("warm").success);
+
+    let request = ExecutionRequest::new(
+        CodeLanguage::Python,
+        "import sys, time\nsys.stdout.write('started\\n')\nsys.stdout.write('X' * (11 * 1024 * 1024))\nsys.stdout.flush()\ntime.sleep(10)",
+    )
+    .with_timeout(3_000);
+    let res = manager.execute("py-trunc-timeout", &request).expect("timeout result");
+    assert!(res.timed_out);
+    assert!(!res.success);
+    assert!(res.output_truncated, "a timeout must not hide that output was truncated");
+    assert!(res.stdout.starts_with("started"), "stdout must retain the prefix written before the timeout");
+    assert!(res.stdout.len() <= crate::session::MAX_STREAM_BYTES);
+    assert!(!manager.contains("py-trunc-timeout"));
+}
+
+#[test]
+fn python_background_subprocess_does_not_delay_chunk_completion() {
+    let Some(mut manager) = manager_for(CodeLanguage::Python) else {
+        return;
+    };
+
+    let warm = chunk(CodeLanguage::Python, "print('warm')");
+    assert!(manager.execute("py-bg", &warm).expect("warm").success);
+
+    let code = "import subprocess, sys\nsubprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)'])\nprint('clean-chunk', flush=True)";
+    let request = ExecutionRequest::new(CodeLanguage::Python, code).with_timeout(300);
+    let res = manager.execute("py-bg", &request).expect("background chunk");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert!(!res.timed_out, "a background subprocess must not make the chunk wait for EOF");
+    assert_eq!(res.stdout.trim(), "clean-chunk");
+
+    manager.close_session("py-bg");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn python_collectors_release_descriptors_between_chunks() {
+    let Some(mut manager) = manager_for(CodeLanguage::Python) else {
+        return;
+    };
+
+    let warm = chunk(CodeLanguage::Python, "print('warm')");
+    assert!(manager.execute("py-fds", &warm).expect("warm").success);
+    let pid =
+        manager.active_sessions().into_iter().find(|session| session.session_id == "py-fds").and_then(|session| session.pid).expect("session pid");
+    let count_fds = || fs::read_dir(format!("/proc/{pid}/fd")).map(|entries| entries.count()).unwrap_or(0);
+    let baseline = count_fds();
+
+    for _ in 0..5 {
+        let code = "import subprocess, sys\nsubprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)'])";
+        let res = manager.execute("py-fds", &chunk(CodeLanguage::Python, code)).expect("background chunk");
+        assert!(res.success, "stderr: {}", res.stderr);
+    }
+
+    let after = count_fds();
+    assert!(after <= baseline + 4, "collector descriptors leaked: baseline {baseline}, after {after}");
+    manager.close_session("py-fds");
+}
+
+#[test]
+fn python_requested_path_takes_precedence_over_an_earlier_sys_path_entry() {
+    let Some(mut manager) = manager_for(CodeLanguage::Python) else {
+        return;
+    };
+
+    let fixture = TempDirGuard::new("wc-py-path");
+    let first = fixture.path().join("first");
+    let later = fixture.path().join("later");
+    fs::create_dir(&first).expect("create first module dir");
+    fs::create_dir(&later).expect("create later module dir");
+    fs::write(first.join("wc_path_probe.py"), b"VALUE = 'first'\n").expect("write first module");
+    fs::write(later.join("wc_path_probe.py"), b"VALUE = 'later'\n").expect("write later module");
+
+    let later_literal = serde_json::to_string(&later.to_string_lossy()).expect("encode later path");
+    let define = chunk(CodeLanguage::Python, &format!("import sys\nsys.path.insert(0, {later_literal})"));
+    assert!(manager.execute("py-path-prec", &define).expect("define path").success);
+
+    let request = chunk(CodeLanguage::Python, "import wc_path_probe; print(wc_path_probe.VALUE)").with_python_path(&first);
+    let res = manager.execute("py-path-prec", &request).expect("precedence chunk");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert_eq!(res.stdout.trim(), "first", "the requested path must win over an earlier sys.path entry");
+
+    let first_literal = serde_json::to_string(&first.to_string_lossy()).expect("encode first path");
+    let probe = chunk(CodeLanguage::Python, &format!("import sys\nprint({later_literal} in sys.path, {first_literal} in sys.path)"));
+    let probe_result = manager.execute("py-path-prec", &probe).expect("path probe");
+    assert!(probe_result.success, "stderr: {}", probe_result.stderr);
+    assert_eq!(probe_result.stdout.trim(), "True False", "only the driver's path changes are undone");
+
+    manager.close_session("py-path-prec");
 }
 
 #[test]
@@ -1374,9 +1248,7 @@ assert sys.stdout.fileno() == 1
 assert sys.stderr.fileno() == 2
 subprocess.run([sys.executable, "-c", "import sys; sys.stdout.write('from subprocess\\n')"], stdout=sys.stdout)
 "#;
-    let res = manager
-        .execute("py-stream-apis", &chunk(CodeLanguage::Python, code))
-        .expect("exec");
+    let res = manager.execute("py-stream-apis", &chunk(CodeLanguage::Python, code)).expect("exec");
     assert!(res.success, "stderr: {}", res.stderr);
     assert!(res.stdout.contains("binary stdout"));
     assert!(res.stdout.contains("from subprocess"));
@@ -1395,38 +1267,23 @@ fn python_capture_disabled_chunk_does_not_leak_stale_plot() {
     }
 
     // Chunk 1: draw plot with capture disabled
-    let req1 = ExecutionRequest::new(
-        CodeLanguage::Python,
-        "import matplotlib.pyplot as plt\nplt.plot([1, 2, 3])",
-    )
-    .with_plot_capture(false);
+    let req1 = ExecutionRequest::new(CodeLanguage::Python, "import matplotlib.pyplot as plt\nplt.plot([1, 2, 3])").with_plot_capture(false);
     let res1 = manager.execute("py-stale-fig", &req1).expect("chunk 1");
     assert!(res1.success);
     assert!(res1.plot_png.is_none(), "chunk 1 had capture disabled");
 
     // Chunk 2: print text with capture enabled (should NOT emit chunk 1's figure)
-    let req2 =
-        ExecutionRequest::new(CodeLanguage::Python, "print('just text')").with_plot_capture(true);
+    let req2 = ExecutionRequest::new(CodeLanguage::Python, "print('just text')").with_plot_capture(true);
     let res2 = manager.execute("py-stale-fig", &req2).expect("chunk 2");
     assert!(res2.success);
     assert_eq!(res2.stdout.trim(), "just text");
-    assert!(
-        res2.plot_png.is_none(),
-        "chunk 2 only printed text and should not re-emit chunk 1 figure"
-    );
+    assert!(res2.plot_png.is_none(), "chunk 2 only printed text and should not re-emit chunk 1 figure");
 
     // Chunk 3: genuine edit to existing figure with capture enabled
-    let req3 = ExecutionRequest::new(
-        CodeLanguage::Python,
-        "plt.title('Updated Title')\nplt.plot([4, 5, 6])",
-    )
-    .with_plot_capture(true);
+    let req3 = ExecutionRequest::new(CodeLanguage::Python, "plt.title('Updated Title')\nplt.plot([4, 5, 6])").with_plot_capture(true);
     let res3 = manager.execute("py-stale-fig", &req3).expect("chunk 3");
     assert!(res3.success);
-    assert!(
-        res3.plot_png.is_some(),
-        "chunk 3 genuinely edited figure and must be captured"
-    );
+    assert!(res3.plot_png.is_some(), "chunk 3 genuinely edited figure and must be captured");
 
     manager.close_session("py-stale-fig");
 }
@@ -1437,21 +1294,14 @@ fn python_session_handles_overwritten_sys_stderr_during_error() {
         return;
     };
 
-    let req1 = chunk(
-        CodeLanguage::Python,
-        "import sys\nx = 42\nsys.stderr = None\nraise RuntimeError('stderr was None')",
-    );
-    let res1 = manager
-        .execute("py-bad-stderr", &req1)
-        .expect("exec bad stderr");
+    let req1 = chunk(CodeLanguage::Python, "import sys\nx = 42\nsys.stderr = None\nraise RuntimeError('stderr was None')");
+    let res1 = manager.execute("py-bad-stderr", &req1).expect("exec bad stderr");
     assert!(!res1.success);
     assert!(res1.stderr.contains("stderr was None"));
 
     // Session survived and retains state
     let req2 = chunk(CodeLanguage::Python, "print('x is', x)");
-    let res2 = manager
-        .execute("py-bad-stderr", &req2)
-        .expect("exec recovered");
+    let res2 = manager.execute("py-bad-stderr", &req2).expect("exec recovered");
     assert!(res2.success);
     assert_eq!(res2.stdout.trim(), "x is 42");
 
@@ -1466,22 +1316,14 @@ fn r_session_system2_cat_does_not_hang() {
     };
 
     // system2 with default stdin gets EOF immediately
-    let req1 = chunk(
-        CodeLanguage::R,
-        "res <- system2('cat', stdout = TRUE)\ncat('length:', length(res), '\n')",
-    );
+    let req1 = chunk(CodeLanguage::R, "res <- system2('cat', stdout = TRUE)\ncat('length:', length(res), '\n')");
     let res1 = manager.execute("r-system2", &req1).expect("system2 cat");
     assert!(res1.success, "stderr: {}", res1.stderr);
     assert!(res1.stdout.contains("length: 0"));
 
     // system2 with explicit input works
-    let req2 = chunk(
-        CodeLanguage::R,
-        "res <- system2('cat', input = 'hello-system2', stdout = TRUE)\ncat(res, '\n')",
-    );
-    let res2 = manager
-        .execute("r-system2", &req2)
-        .expect("system2 cat with input");
+    let req2 = chunk(CodeLanguage::R, "res <- system2('cat', input = 'hello-system2', stdout = TRUE)\ncat(res, '\n')");
+    let res2 = manager.execute("r-system2", &req2).expect("system2 cat with input");
     assert!(res2.success, "stderr: {}", res2.stderr);
     assert!(res2.stdout.contains("hello-system2"));
 
@@ -1505,11 +1347,7 @@ fn r_session_dispatches_s3_print_from_globalenv() {
     let req2 = chunk(CodeLanguage::R, "x");
     let res2 = manager.execute("r-s3", &req2).expect("print s3 object");
     assert!(res2.success);
-    assert!(
-        res2.stdout.contains("CUSTOM S3 PRINT METHOD"),
-        "stdout was: {:?}",
-        res2.stdout
-    );
+    assert!(res2.stdout.contains("CUSTOM S3 PRINT METHOD"), "stdout was: {:?}", res2.stdout);
 
     manager.close_session("r-s3");
 }
@@ -1520,24 +1358,13 @@ fn r_automatic_print_uses_base_generic_when_global_print_is_shadowed() {
         return;
     };
 
-    let define_shadow = chunk(
-        CodeLanguage::R,
-        "print <- function(x, required) stop('shadowed print called')",
-    );
-    let defined = manager
-        .execute("r-print-shadow", &define_shadow)
-        .expect("define shadowed print");
+    let define_shadow = chunk(CodeLanguage::R, "print <- function(x, required) stop('shadowed print called')");
+    let defined = manager.execute("r-print-shadow", &define_shadow).expect("define shadowed print");
     assert!(defined.success, "stderr: {}", defined.stderr);
 
-    let visible = manager
-        .execute("r-print-shadow", &chunk(CodeLanguage::R, "42"))
-        .expect("automatically print visible value");
+    let visible = manager.execute("r-print-shadow", &chunk(CodeLanguage::R, "42")).expect("automatically print visible value");
     assert!(visible.success, "stderr: {}", visible.stderr);
-    assert!(
-        visible.stdout.contains("42"),
-        "stdout was: {:?}",
-        visible.stdout
-    );
+    assert!(visible.stdout.contains("42"), "stdout was: {:?}", visible.stdout);
 
     manager.close_session("r-print-shadow");
 }
@@ -1548,21 +1375,14 @@ fn r_session_reports_error_even_after_close_all_connections() {
         return;
     };
 
-    let req1 = chunk(
-        CodeLanguage::R,
-        "val <- 99\ncloseAllConnections()\nstop('boom after close connections')",
-    );
-    let res1 = manager
-        .execute("r-close-conn-err", &req1)
-        .expect("exec error");
+    let req1 = chunk(CodeLanguage::R, "val <- 99\ncloseAllConnections()\nstop('boom after close connections')");
+    let res1 = manager.execute("r-close-conn-err", &req1).expect("exec error");
     assert!(!res1.success);
     assert!(res1.stderr.contains("boom after close connections"));
 
     // Session remains intact and state was preserved
     let req2 = chunk(CodeLanguage::R, "cat('val:', val, '\n')");
-    let res2 = manager
-        .execute("r-close-conn-err", &req2)
-        .expect("exec next");
+    let res2 = manager.execute("r-close-conn-err", &req2).expect("exec next");
     assert!(res2.success);
     assert_eq!(res2.stdout.trim(), "val: 99");
 
@@ -1592,9 +1412,7 @@ fn session_unrepresentable_timeout_is_rejected() {
         };
 
         let req = ExecutionRequest::new(CodeLanguage::Python, "x = 1").with_timeout(u64::MAX);
-        let err = manager
-            .execute("py-unrep", &req)
-            .expect_err("should reject overflow");
+        let err = manager.execute("py-unrep", &req).expect_err("should reject overflow");
         assert!(matches!(err, KernelError::SessionProtocol(_)));
     }
 }

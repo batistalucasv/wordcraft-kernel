@@ -312,11 +312,7 @@ pub enum KernelError {
     UnterminatedPlaceholder { template: String },
 
     #[error("Session '{session_id}' was started for {existing}, but request is for {requested}")]
-    SessionLanguageMismatch {
-        session_id: String,
-        existing: CodeLanguage,
-        requested: CodeLanguage,
-    },
+    SessionLanguageMismatch { session_id: String, existing: CodeLanguage, requested: CodeLanguage },
 
     #[error("Session '{session_id}' terminated unexpectedly: {detail}")]
     SessionTerminated { session_id: String, detail: String },
