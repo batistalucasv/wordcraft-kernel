@@ -5,8 +5,7 @@ use std::process::Command;
 use std::process::Stdio;
 
 use wordcraft_kernel::{
-    CodeLanguage, ExecutionRequest, ExecutionResult, KernelError, PlotFormat,
-    execute as kernel_execute, is_language_available, which_binary,
+    CodeLanguage, ExecutionRequest, ExecutionResult, KernelError, PlotFormat, execute as kernel_execute, is_language_available, which_binary,
 };
 
 const MAX_CAPTURE_BYTES: usize = 10 * 1024 * 1024;
@@ -15,9 +14,7 @@ fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelError> {
     let request = if request.supervisor_path.is_some() {
         request.clone()
     } else {
-        request
-            .clone()
-            .with_supervisor_path(env!("CARGO_BIN_EXE_wc-kernel-supervisor"))
+        request.clone().with_supervisor_path(env!("CARGO_BIN_EXE_wc-kernel-supervisor"))
     };
     kernel_execute(&request)
 }
@@ -29,8 +26,7 @@ struct TempTestDir {
 impl TempTestDir {
     fn create(prefix: &str) -> Self {
         for attempt in 0..64 {
-            let path =
-                std::env::temp_dir().join(format!("{prefix}-{}-{attempt}", std::process::id()));
+            let path = std::env::temp_dir().join(format!("{prefix}-{}-{attempt}", std::process::id()));
             match fs::create_dir(&path) {
                 Ok(()) => return Self { path },
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -54,11 +50,7 @@ impl Drop for TempTestDir {
 fn relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
     let from_components: Vec<_> = from.components().collect();
     let to_components: Vec<_> = to.components().collect();
-    let common = from_components
-        .iter()
-        .zip(&to_components)
-        .take_while(|(left, right)| left == right)
-        .count();
+    let common = from_components.iter().zip(&to_components).take_while(|(left, right)| left == right).count();
     if common == 0 {
         return None;
     }
@@ -87,10 +79,7 @@ fn assert_process_is_gone(pid: &str) {
             Ok(_) => {}
         }
         if std::time::Instant::now() >= deadline {
-            let _ = Command::new("kill")
-                .args(["-KILL", pid])
-                .stderr(Stdio::null())
-                .status();
+            let _ = Command::new("kill").args(["-KILL", pid]).stderr(Stdio::null()).status();
             panic!("descendant {pid} outlived the supervisor cleanup");
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -122,17 +111,12 @@ fn python_working_dir_execution() {
     }
 
     let temp_dir = std::env::temp_dir();
-    let req = ExecutionRequest::new(
-        CodeLanguage::Python,
-        "import os\nprint(os.path.realpath(os.getcwd()))",
-    )
-    .with_working_dir(&temp_dir);
+    let req = ExecutionRequest::new(CodeLanguage::Python, "import os\nprint(os.path.realpath(os.getcwd()))").with_working_dir(&temp_dir);
     let result = execute(&req).expect("execution failed");
 
     assert!(result.success);
     let expected_dir = fs::canonicalize(&temp_dir).expect("canonical temp dir");
-    let printed_dir =
-        fs::canonicalize(PathBuf::from(result.stdout.trim())).expect("canonical printed dir");
+    let printed_dir = fs::canonicalize(PathBuf::from(result.stdout.trim())).expect("canonical printed dir");
     assert_eq!(printed_dir, expected_dir);
 }
 
@@ -158,11 +142,7 @@ fn python_timeout_kills_runaway_process() {
     }
 
     // Runaway infinite loop with 300ms timeout
-    let req = ExecutionRequest::new(
-        CodeLanguage::Python,
-        "import time\nwhile True:\n    time.sleep(0.05)",
-    )
-    .with_timeout(300);
+    let req = ExecutionRequest::new(CodeLanguage::Python, "import time\nwhile True:\n    time.sleep(0.05)").with_timeout(300);
     let result = execute(&req).expect("execution failed");
 
     assert!(!result.success);
@@ -175,12 +155,9 @@ fn python_timeout_preserves_partial_stdout() {
         return;
     }
 
-    let req = ExecutionRequest::new(
-        CodeLanguage::Python,
-        "import time\nprint('before timeout', flush=True)\ntime.sleep(5)",
-    )
-    .with_plot_capture(false)
-    .with_timeout(300);
+    let req = ExecutionRequest::new(CodeLanguage::Python, "import time\nprint('before timeout', flush=True)\ntime.sleep(5)")
+        .with_plot_capture(false)
+        .with_timeout(300);
     let result = execute(&req).expect("execution failed");
 
     assert!(result.timed_out);
@@ -239,22 +216,11 @@ print(child.pid, flush=True)
     let req = ExecutionRequest::new(CodeLanguage::Python, code).with_plot_capture(false);
     let result = execute(&req).expect("execution failed");
 
-    let child_pid = result
-        .stdout
-        .trim()
-        .parse::<u32>()
-        .expect("print child pid");
+    let child_pid = result.stdout.trim().parse::<u32>().expect("print child pid");
     let child_pid = child_pid.to_string();
-    let alive = Command::new("kill")
-        .args(["-0", child_pid.as_str()])
-        .stderr(Stdio::null())
-        .status()
-        .expect("check escaped test child");
+    let alive = Command::new("kill").args(["-0", child_pid.as_str()]).stderr(Stdio::null()).status().expect("check escaped test child");
     if alive.success() {
-        let _ = Command::new("kill")
-            .args(["-KILL", child_pid.as_str()])
-            .stderr(Stdio::null())
-            .status();
+        let _ = Command::new("kill").args(["-KILL", child_pid.as_str()]).stderr(Stdio::null()).status();
     }
     assert!(result.success);
     assert!(!alive.success(), "escaped descendant remained alive");
@@ -272,14 +238,9 @@ fn forced_supervisor_termination_kills_its_process_group() {
 
     let temp_dir = TempTestDir::create("wc-supervisor-stall");
     let helper = temp_dir.path().join("stalled-supervisor");
-    fs::write(
-        &helper,
-        "#!/bin/sh\ntrap '' TERM\nsleep 60 &\nchild=$!\necho \"$child\" > child.pid\n: > child.ready\nsleep 60\nwait\n",
-    )
-    .expect("write stalled helper");
-    let mut permissions = fs::metadata(&helper)
-        .expect("read helper metadata")
-        .permissions();
+    fs::write(&helper, "#!/bin/sh\ntrap '' TERM\nsleep 60 &\nchild=$!\necho \"$child\" > child.pid\n: > child.ready\nsleep 60\nwait\n")
+        .expect("write stalled helper");
+    let mut permissions = fs::metadata(&helper).expect("read helper metadata").permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(&helper, permissions).expect("make helper executable");
 
@@ -290,14 +251,8 @@ fn forced_supervisor_termination_kills_its_process_group() {
         .with_plot_capture(false);
     assert!(execute(&request).is_err());
 
-    assert!(
-        temp_dir.path().join("child.ready").is_file(),
-        "fake supervisor did not start its descendant"
-    );
-    let child_pid = fs::read_to_string(temp_dir.path().join("child.pid"))
-        .expect("read helper child pid")
-        .trim()
-        .to_string();
+    assert!(temp_dir.path().join("child.ready").is_file(), "fake supervisor did not start its descendant");
+    let child_pid = fs::read_to_string(temp_dir.path().join("child.pid")).expect("read helper child pid").trim().to_string();
     assert_process_is_gone(&child_pid);
 }
 
@@ -317,9 +272,7 @@ fn cancellation_lets_the_supervisor_clean_up_before_the_hard_fallback() {
         "#!/bin/sh\ntrap 'echo term > term.received; kill -KILL \"$child\"; wait \"$child\" 2>/dev/null; exit 0' TERM\nsleep 60 &\nchild=$!\necho \"$child\" > child.pid\nwhile :; do sleep 0.05; done\n",
     )
     .expect("write cancelling helper");
-    let mut permissions = fs::metadata(&helper)
-        .expect("read helper metadata")
-        .permissions();
+    let mut permissions = fs::metadata(&helper).expect("read helper metadata").permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(&helper, permissions).expect("make helper executable");
 
@@ -335,14 +288,8 @@ fn cancellation_lets_the_supervisor_clean_up_before_the_hard_fallback() {
     // cooperative cancellation must finish before the four-second grace that
     // leads to the hard fallback.
     assert!(started.elapsed() < std::time::Duration::from_secs(7));
-    assert!(
-        temp_dir.path().join("term.received").is_file(),
-        "the supervisor was not asked to cancel its interpreter"
-    );
-    let child_pid = fs::read_to_string(temp_dir.path().join("child.pid"))
-        .expect("read helper child pid")
-        .trim()
-        .to_string();
+    assert!(temp_dir.path().join("term.received").is_file(), "the supervisor was not asked to cancel its interpreter");
+    let child_pid = fs::read_to_string(temp_dir.path().join("child.pid")).expect("read helper child pid").trim().to_string();
     assert_process_is_gone(&child_pid);
 }
 
@@ -358,27 +305,17 @@ fn supervisor_diagnostics_do_not_wait_for_inherited_stderr() {
     fs::write(&helper, "#!/bin/sh\nsleep 3 &\nexit 0\n").expect("write helper");
 
     use std::os::unix::fs::PermissionsExt;
-    let mut permissions = fs::metadata(&helper)
-        .expect("read helper metadata")
-        .permissions();
+    let mut permissions = fs::metadata(&helper).expect("read helper metadata").permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(&helper, permissions).expect("make helper executable");
 
-    let request = ExecutionRequest::new(CodeLanguage::Python, "")
-        .with_supervisor_path(&helper)
-        .with_plot_capture(false);
+    let request = ExecutionRequest::new(CodeLanguage::Python, "").with_supervisor_path(&helper).with_plot_capture(false);
     let started = std::time::Instant::now();
     match execute(&request) {
-        Err(KernelError::Io(message)) => assert!(
-            message.contains("read supervisor result"),
-            "expected a missing supervisor result, got: {message}"
-        ),
+        Err(KernelError::Io(message)) => assert!(message.contains("read supervisor result"), "expected a missing supervisor result, got: {message}"),
         other => panic!("expected a missing supervisor result, got: {other:?}"),
     }
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(2),
-        "reading supervisor diagnostics waited for the inherited stderr handle"
-    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "reading supervisor diagnostics waited for the inherited stderr handle");
 }
 
 #[cfg(windows)]
@@ -399,10 +336,7 @@ print(child.pid, flush=True)
     let req = ExecutionRequest::new(CodeLanguage::Python, code).with_plot_capture(false);
     let result = execute(&req).expect("execution failed");
     let child_pid = result.stdout.trim().to_string();
-    let output = Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {child_pid}"), "/NH"])
-        .output()
-        .expect("check escaped test child");
+    let output = Command::new("tasklist").args(["/FI", &format!("PID eq {child_pid}"), "/NH"]).output().expect("check escaped test child");
     assert!(output.status.success(), "tasklist failed");
     let listed = String::from_utf8_lossy(&output.stdout).lines().any(|line| {
         let mut fields = line.split_whitespace();
@@ -410,9 +344,7 @@ print(child.pid, flush=True)
         fields.next() == Some(child_pid.as_str())
     });
     if listed {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &child_pid, "/T", "/F"])
-            .status();
+        let _ = Command::new("taskkill").args(["/PID", &child_pid, "/T", "/F"]).status();
     }
     assert!(result.success);
     assert!(!listed, "descendant remained alive");
@@ -444,20 +376,14 @@ print(child.pid, flush=True)
 fn assert_descendant_stopped(pid: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
-        let state = Command::new("ps")
-            .args(["-o", "stat=", "-p", pid])
-            .output()
-            .expect("probe descendant state");
+        let state = Command::new("ps").args(["-o", "stat=", "-p", pid]).output().expect("probe descendant state");
         let state = String::from_utf8_lossy(&state.stdout);
         let state = state.trim();
         if state.is_empty() || state.starts_with('Z') {
             return;
         }
         if std::time::Instant::now() >= deadline {
-            let _ = Command::new("kill")
-                .args(["-KILL", pid])
-                .stderr(Stdio::null())
-                .status();
+            let _ = Command::new("kill").args(["-KILL", pid]).stderr(Stdio::null()).status();
             panic!("same-group descendant {pid} outlived the interpreter");
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -473,11 +399,7 @@ fn python_path_is_used_for_module_lookup() {
     let helper_dir = TempTestDir::create("wc-python-path");
     fs::write(helper_dir.path().join("wc_helper.py"), "VALUE = 42\n").expect("write helper module");
 
-    let req = ExecutionRequest::new(
-        CodeLanguage::Python,
-        "import wc_helper\nprint(wc_helper.VALUE)",
-    )
-    .with_python_path(helper_dir.path());
+    let req = ExecutionRequest::new(CodeLanguage::Python, "import wc_helper\nprint(wc_helper.VALUE)").with_python_path(helper_dir.path());
     let result = execute(&req).expect("execution failed");
 
     assert!(result.success);
@@ -491,24 +413,11 @@ fn python_path_cannot_shadow_wrapper_imports() {
     }
 
     let helper_dir = TempTestDir::create("wc-python-shadow");
-    fs::write(helper_dir.path().join("helper_module.py"), "VALUE = 42\n")
-        .expect("write helper module");
-    fs::write(
-        helper_dir.path().join("ast.py"),
-        "raise RuntimeError('shadowed ast imported')\n",
-    )
-    .expect("write ast shadow");
-    fs::write(
-        helper_dir.path().join("json.py"),
-        "raise RuntimeError('shadowed json imported')\n",
-    )
-    .expect("write json shadow");
+    fs::write(helper_dir.path().join("helper_module.py"), "VALUE = 42\n").expect("write helper module");
+    fs::write(helper_dir.path().join("ast.py"), "raise RuntimeError('shadowed ast imported')\n").expect("write ast shadow");
+    fs::write(helper_dir.path().join("json.py"), "raise RuntimeError('shadowed json imported')\n").expect("write json shadow");
 
-    let req = ExecutionRequest::new(
-        CodeLanguage::Python,
-        "import helper_module\nprint(helper_module.VALUE)",
-    )
-    .with_python_path(helper_dir.path());
+    let req = ExecutionRequest::new(CodeLanguage::Python, "import helper_module\nprint(helper_module.VALUE)").with_python_path(helper_dir.path());
     let result = execute(&req).expect("execution failed");
 
     assert!(result.success, "{}", result.stderr);
@@ -521,18 +430,11 @@ fn python_invalid_utf8_output_respects_the_byte_limit() {
         return;
     }
 
-    let code =
-        "import sys\nsys.stdout.buffer.write(b'\\xff' * (9 * 1024 * 1024))\nsys.stdout.flush()";
-    let result =
-        execute(&ExecutionRequest::new(CodeLanguage::Python, code).with_plot_capture(false))
-            .expect("execution failed");
+    let code = "import sys\nsys.stdout.buffer.write(b'\\xff' * (9 * 1024 * 1024))\nsys.stdout.flush()";
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code).with_plot_capture(false)).expect("execution failed");
 
     assert!(result.output_truncated);
-    assert!(
-        result.stdout.len() <= MAX_CAPTURE_BYTES,
-        "decoded stdout exceeded the limit: {} bytes",
-        result.stdout.len()
-    );
+    assert!(result.stdout.len() <= MAX_CAPTURE_BYTES, "decoded stdout exceeded the limit: {} bytes", result.stdout.len());
 }
 
 #[test]
@@ -541,11 +443,8 @@ fn python_path_supports_future_imports() {
         return;
     }
 
-    let req = ExecutionRequest::new(
-        CodeLanguage::Python,
-        "from __future__ import annotations\nvalue: int = 42\nprint(value)",
-    )
-    .with_python_path(std::env::temp_dir());
+    let req = ExecutionRequest::new(CodeLanguage::Python, "from __future__ import annotations\nvalue: int = 42\nprint(value)")
+        .with_python_path(std::env::temp_dir());
     let result = execute(&req).expect("execution failed");
 
     assert!(result.success, "{}", result.stderr);
@@ -561,11 +460,7 @@ fn python_path_accepts_path_separator_in_directory_name() {
 
     let helper_dir = TempTestDir::create("wc-python:path");
     fs::write(helper_dir.path().join("wc_helper.py"), "VALUE = 42\n").expect("write helper module");
-    let req = ExecutionRequest::new(
-        CodeLanguage::Python,
-        "import wc_helper\nprint(wc_helper.VALUE)",
-    )
-    .with_python_path(helper_dir.path());
+    let req = ExecutionRequest::new(CodeLanguage::Python, "import wc_helper\nprint(wc_helper.VALUE)").with_python_path(helper_dir.path());
     let result = execute(&req).expect("execution failed");
 
     assert!(result.success);
@@ -578,12 +473,9 @@ fn relative_supervisor_path_is_resolved_before_changing_directory() {
         return;
     }
 
-    let current_dir = fs::canonicalize(std::env::current_dir().expect("current directory"))
-        .expect("canonical current directory");
-    let helper_path = fs::canonicalize(env!("CARGO_BIN_EXE_wc-kernel-supervisor"))
-        .expect("canonical supervisor helper path");
-    let relative_helper =
-        relative_path(&current_dir, &helper_path).expect("helper must share the current volume");
+    let current_dir = fs::canonicalize(std::env::current_dir().expect("current directory")).expect("canonical current directory");
+    let helper_path = fs::canonicalize(env!("CARGO_BIN_EXE_wc-kernel-supervisor")).expect("canonical supervisor helper path");
+    let relative_helper = relative_path(&current_dir, &helper_path).expect("helper must share the current volume");
     let working_dir = TempTestDir::create("wc-supervisor-cwd");
     let request = ExecutionRequest::new(CodeLanguage::Python, "print('ready')")
         .with_supervisor_path(relative_helper)
@@ -631,8 +523,7 @@ fn r_timeout_kills_runaway_process() {
         return;
     }
 
-    let req =
-        ExecutionRequest::new(CodeLanguage::R, "repeat { Sys.sleep(0.05) }").with_timeout(300);
+    let req = ExecutionRequest::new(CodeLanguage::R, "repeat { Sys.sleep(0.05) }").with_timeout(300);
     let result = execute(&req).expect("execution failed");
 
     assert!(!result.success);
@@ -654,10 +545,7 @@ plot(x, y, main = "Test Curve")
     let result = execute(&req).expect("execution failed");
 
     assert!(result.success);
-    assert!(
-        result.plot_png.is_some(),
-        "Expected plot PNG bytes to be captured"
-    );
+    assert!(result.plot_png.is_some(), "Expected plot PNG bytes to be captured");
     assert!(result.plot_svg.is_none());
     let png_bytes = result.plot_png.unwrap();
     // Valid PNG header: 0x89 'P' 'N' 'G'
@@ -680,10 +568,7 @@ plot(x, y, main = "Test SVG Curve")
 
     assert!(result.success);
     assert!(result.plot_png.is_none());
-    assert!(
-        result.plot_svg.is_some(),
-        "Expected plot SVG string to be captured"
-    );
+    assert!(result.plot_svg.is_some(), "Expected plot SVG string to be captured");
     let svg = result.plot_svg.unwrap();
     assert!(svg.contains("<svg"), "SVG output must contain '<svg'");
 }
@@ -700,10 +585,7 @@ fn r_plot_prefer_svg_deserialized_request() {
 
     assert!(result.success);
     assert!(result.plot_png.is_none());
-    assert!(
-        result.plot_svg.is_some(),
-        "Expected SVG capture from prefer_svg"
-    );
+    assert!(result.plot_svg.is_some(), "Expected SVG capture from prefer_svg");
     assert!(result.plot_svg.unwrap().contains("<svg"));
 }
 
@@ -744,10 +626,7 @@ plot(5:1)
 
     assert!(result.success);
     assert!(result.plot_png.is_some(), "Expected completed PNG bytes");
-    assert!(
-        result.plot_svg.is_none(),
-        "Must not copy the other active device as the SVG"
-    );
+    assert!(result.plot_svg.is_none(), "Must not copy the other active device as the SVG");
 }
 
 #[test]
@@ -767,10 +646,7 @@ plot(5:1)
 
     assert!(result.success);
     assert!(result.plot_png.is_some(), "Expected completed PNG bytes");
-    assert!(
-        result.plot_svg.is_none(),
-        "Must not copy the replacement same-type device as the SVG"
-    );
+    assert!(result.plot_svg.is_none(), "Must not copy the replacement same-type device as the SVG");
 }
 
 fn python_has_matplotlib() -> bool {
@@ -778,10 +654,7 @@ fn python_has_matplotlib() -> bool {
         return false;
     };
     let output = Command::new(python)
-        .args([
-            "-c",
-            "import importlib.util, sys; sys.exit(42 if importlib.util.find_spec('matplotlib') is None else 0)",
-        ])
+        .args(["-c", "import importlib.util, sys; sys.exit(42 if importlib.util.find_spec('matplotlib') is None else 0)"])
         .output()
         .expect("probe matplotlib with the configured Python interpreter");
     match output.status.code() {
@@ -807,12 +680,7 @@ plt.plot([1, 2, 3], [10, 20, 30])
 
     assert!(result.success);
     assert!(result.plot_png.is_some(), "Expected PNG plot output");
-    assert!(
-        result
-            .plot_png
-            .unwrap()
-            .starts_with(&[0x89, b'P', b'N', b'G'])
-    );
+    assert!(result.plot_png.unwrap().starts_with(&[0x89, b'P', b'N', b'G']));
     assert!(result.plot_svg.is_none());
 }
 
@@ -860,10 +728,7 @@ plt.plot([1, 2, 3], [10, 20, 30])
 
     assert!(result.success);
     assert!(result.plot_png.is_none());
-    assert!(
-        result.plot_svg.is_some(),
-        "Expected SVG capture from prefer_svg"
-    );
+    assert!(result.plot_svg.is_some(), "Expected SVG capture from prefer_svg");
     assert!(result.plot_svg.unwrap().contains("<svg"));
 }
 

@@ -6,18 +6,9 @@ use super::*;
 fn code_language_parsing() {
     assert!(matches!("r".parse::<CodeLanguage>(), Ok(CodeLanguage::R)));
     assert!(matches!("R".parse::<CodeLanguage>(), Ok(CodeLanguage::R)));
-    assert!(matches!(
-        "python".parse::<CodeLanguage>(),
-        Ok(CodeLanguage::Python)
-    ));
-    assert!(matches!(
-        "py".parse::<CodeLanguage>(),
-        Ok(CodeLanguage::Python)
-    ));
-    assert!(matches!(
-        "Python".parse::<CodeLanguage>(),
-        Ok(CodeLanguage::Python)
-    ));
+    assert!(matches!("python".parse::<CodeLanguage>(), Ok(CodeLanguage::Python)));
+    assert!(matches!("py".parse::<CodeLanguage>(), Ok(CodeLanguage::Python)));
+    assert!(matches!("Python".parse::<CodeLanguage>(), Ok(CodeLanguage::Python)));
     assert!("javascript".parse::<CodeLanguage>().is_err());
 }
 
@@ -41,16 +32,12 @@ fn execution_request_defaults() {
     assert!(!customized.capture_plots);
     assert_eq!(customized.plot_format, PlotFormat::Svg);
     assert_eq!(customized.working_dir, Some(PathBuf::from("/tmp")));
-    assert_eq!(
-        customized.supervisor_path,
-        Some(PathBuf::from("/tmp/wc-kernel-supervisor"))
-    );
+    assert_eq!(customized.supervisor_path, Some(PathBuf::from("/tmp/wc-kernel-supervisor")));
 }
 
 #[test]
 fn execution_request_deserialization_defaults_plot_options() -> Result<(), serde_json::Error> {
-    let omitted =
-        r#"{"language":"python","code":"print('hello')","timeout_ms":1000,"capture_plots":true}"#;
+    let omitted = r#"{"language":"python","code":"print('hello')","timeout_ms":1000,"capture_plots":true}"#;
     let request: ExecutionRequest = serde_json::from_str(omitted)?;
     assert_eq!(request.plot_format, PlotFormat::Png);
     assert!(!request.prefer_svg);
@@ -81,31 +68,10 @@ fn execution_request_prefer_svg() {
 fn effective_plot_format_combinations() {
     let base = ExecutionRequest::new(CodeLanguage::Python, "");
     assert_eq!(base.effective_plot_format(), PlotFormat::Png);
-    assert_eq!(
-        base.clone().with_prefer_svg(true).effective_plot_format(),
-        PlotFormat::Svg
-    );
-    assert_eq!(
-        base.clone()
-            .with_plot_format(PlotFormat::Both)
-            .with_prefer_svg(true)
-            .effective_plot_format(),
-        PlotFormat::Both
-    );
-    assert_eq!(
-        base.clone()
-            .with_prefer_svg(true)
-            .with_plot_format(PlotFormat::Svg)
-            .with_prefer_svg(false)
-            .effective_plot_format(),
-        PlotFormat::Svg
-    );
-    assert_eq!(
-        base.with_plot_format(PlotFormat::Png)
-            .with_prefer_svg(true)
-            .effective_plot_format(),
-        PlotFormat::Svg
-    );
+    assert_eq!(base.clone().with_prefer_svg(true).effective_plot_format(), PlotFormat::Svg);
+    assert_eq!(base.clone().with_plot_format(PlotFormat::Both).with_prefer_svg(true).effective_plot_format(), PlotFormat::Both);
+    assert_eq!(base.clone().with_prefer_svg(true).with_plot_format(PlotFormat::Svg).with_prefer_svg(false).effective_plot_format(), PlotFormat::Svg);
+    assert_eq!(base.with_plot_format(PlotFormat::Png).with_prefer_svg(true).effective_plot_format(), PlotFormat::Svg);
 }
 
 #[test]
@@ -136,12 +102,8 @@ fn pandas_available() -> bool {
     if !is_language_available(CodeLanguage::Python) {
         return false;
     }
-    let request = ExecutionRequest::new(CodeLanguage::Python, "import pandas")
-        .with_timeout(60_000)
-        .with_plot_capture(false);
-    execute(&request)
-        .map(|result| result.success)
-        .unwrap_or(false)
+    let request = ExecutionRequest::new(CodeLanguage::Python, "import pandas").with_timeout(60_000).with_plot_capture(false);
+    execute(&request).map(|result| result.success).unwrap_or(false)
 }
 
 #[test]
@@ -154,17 +116,13 @@ fn python_dataframe_last_expression_is_captured() {
 import pandas as pd
 pd.DataFrame({"species": ["setosa", "virginica"], "abundance": [50, 12]})
 "##;
-    let result =
-        execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
 
     assert!(result.success);
     assert_eq!(result.tables.len(), 1);
     let table = &result.tables[0];
     assert_eq!(table.headers, vec!["species", "abundance"]);
-    assert_eq!(
-        table.rows,
-        vec![vec!["setosa", "50"], vec!["virginica", "12"]]
-    );
+    assert_eq!(table.rows, vec![vec!["setosa", "50"], vec!["virginica", "12"]]);
 }
 
 #[test]
@@ -179,8 +137,7 @@ frame = pd.DataFrame({"site": ["A", "B"], "richness": [7, 9]})
 wc_table(frame)
 print("captured")
 "##;
-    let result =
-        execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
 
     assert!(result.success);
     assert_eq!(result.tables.len(), 1);
@@ -198,8 +155,7 @@ fn python_index_is_kept_as_leading_column() {
 import pandas as pd
 pd.DataFrame({"site": ["A", "B"], "richness": [7, 9]}).set_index("site")
 "##;
-    let result =
-        execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
 
     assert!(result.success);
     assert_eq!(result.tables.len(), 1);
@@ -213,11 +169,7 @@ fn python_without_dataframe_reports_no_tables() {
         return;
     }
 
-    let result = execute(&ExecutionRequest::new(
-        CodeLanguage::Python,
-        "print('plain text only')",
-    ))
-    .expect("execution failed");
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, "print('plain text only')")).expect("execution failed");
 
     assert!(result.success);
     assert!(result.tables.is_empty());
@@ -235,20 +187,12 @@ pd.DataFrame({
     "label": ['quote " here', "back\\slash", "line\nbreak", "tab\there", "ação", None],
 })
 "##;
-    let result =
-        execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
 
     assert!(result.success);
     assert_eq!(
         result.tables[0].rows,
-        vec![
-            vec!["quote \" here"],
-            vec!["back\\slash"],
-            vec!["line\nbreak"],
-            vec!["tab\there"],
-            vec!["ação"],
-            vec!["NA"],
-        ]
+        vec![vec!["quote \" here"], vec!["back\\slash"], vec!["line\nbreak"], vec!["tab\there"], vec!["ação"], vec!["NA"],]
     );
 }
 
@@ -267,10 +211,7 @@ data.frame(species = c("setosa", "virginica"), abundance = c(50L, 12L))
     assert_eq!(result.tables.len(), 1);
     let table = &result.tables[0];
     assert_eq!(table.headers, vec!["species", "abundance"]);
-    assert_eq!(
-        table.rows,
-        vec![vec!["setosa", "50"], vec!["virginica", "12"]]
-    );
+    assert_eq!(table.rows, vec![vec!["setosa", "50"], vec!["virginica", "12"]]);
 }
 
 #[test]
@@ -314,12 +255,7 @@ anova(lm(response ~ group))
     assert_eq!(table.rows.len(), 2);
     assert_eq!(table.rows[0][0], "group");
     assert_eq!(table.rows[1][0], "Residuals");
-    assert!(
-        table
-            .rows
-            .iter()
-            .all(|row| row.len() == table.headers.len())
-    );
+    assert!(table.rows.iter().all(|row| row.len() == table.headers.len()));
 }
 
 #[test]
@@ -336,14 +272,7 @@ data.frame(label = c("quote \" here", "back\\slash", "line\nbreak", "tab\there",
     assert!(result.success);
     assert_eq!(
         result.tables[0].rows,
-        vec![
-            vec!["quote \" here"],
-            vec!["back\\slash"],
-            vec!["line\nbreak"],
-            vec!["tab\there"],
-            vec!["ação"],
-            vec!["NA"],
-        ]
+        vec![vec!["quote \" here"], vec!["back\\slash"], vec!["line\nbreak"], vec!["tab\there"], vec!["ação"], vec!["NA"],]
     );
 }
 
@@ -353,11 +282,7 @@ fn r_without_dataframe_reports_no_tables() {
         return;
     }
 
-    let result = execute(&ExecutionRequest::new(
-        CodeLanguage::R,
-        "cat('plain text only\n')",
-    ))
-    .expect("execution failed");
+    let result = execute(&ExecutionRequest::new(CodeLanguage::R, "cat('plain text only\n')")).expect("execution failed");
 
     assert!(result.success);
     assert!(result.tables.is_empty());
@@ -376,8 +301,7 @@ with open("__wordcraft_tables__.json", "w", encoding="utf-8") as handle:
     handle.write('{"tables":[{"headers":["a"],"rows":[[1,2]]}]}')
 print("done")
 "##;
-    let result =
-        execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
 
     assert!(result.success);
     assert!(result.tables.is_empty());
@@ -388,10 +312,7 @@ fn table_payload_is_clamped_and_rectangular() {
     let unique_id = format!(
         "wordcraft-tables-unit-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
     );
     let dir = std::env::temp_dir().join(unique_id);
     create_scratch_dir(&dir).expect("create scratch dir");
@@ -399,9 +320,7 @@ fn table_payload_is_clamped_and_rectangular() {
     let path = dir.join("tables.json");
 
     let long_cell = "x".repeat(MAX_CELL_CHARS + 10);
-    let payload = format!(
-        r#"{{"tables":[{{"headers":["a","b"],"rows":[["only-a"],["1","2","3"],["{long_cell}"]]}}]}}"#
-    );
+    let payload = format!(r#"{{"tables":[{{"headers":["a","b"],"rows":[["only-a"],["1","2","3"],["{long_cell}"]]}}]}}"#);
     fs::write(&path, payload).expect("write payload");
 
     let tables = read_tables(&path);
@@ -420,10 +339,7 @@ fn malformed_table_payload_is_ignored() {
     let unique_id = format!(
         "wordcraft-tables-bad-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
     );
     let dir = std::env::temp_dir().join(unique_id);
     create_scratch_dir(&dir).expect("create scratch dir");
@@ -485,8 +401,7 @@ wc_table(df)
 json = {"shadow": True}
 print("ok")
 "#;
-    let result =
-        execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
     assert!(result.success);
     assert_eq!(result.tables.len(), 1);
     assert_eq!(result.tables[0].rows, vec![vec!["1"], vec!["2"]]);
@@ -505,8 +420,7 @@ pd.DataFrame({
     "flt": [0.1234567890123],
 })
 "#;
-    let result =
-        execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
     assert!(result.success);
     assert_eq!(result.tables.len(), 1);
     assert_eq!(result.tables[0].rows[0][0], "2023-01-01 12:00:00");
@@ -523,8 +437,7 @@ fn python_string_index_is_kept_as_leading_column() {
 import pandas as pd
 pd.DataFrame({"value": [7, 9]}, index=["0", "1"])
 "#;
-    let result =
-        execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
     assert!(result.success);
     assert_eq!(result.tables.len(), 1);
     assert_eq!(result.tables[0].headers, vec!["", "value"]);
@@ -542,8 +455,7 @@ import pandas as pd
 df = pd.DataFrame({"x": [1, 2]})
 wc_table(df)
 "#;
-    let result =
-        execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
     assert!(result.success);
     assert_eq!(result.tables.len(), 1);
 }
@@ -558,8 +470,7 @@ fn python_table_rows_clamped_to_limit() {
 import pandas as pd
 pd.DataFrame({"x": range(10050)})
 "#;
-    let result =
-        execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
     assert!(result.success);
     assert_eq!(result.tables.len(), 1);
     assert_eq!(result.tables[0].rows.len(), 10_000);
@@ -617,14 +528,7 @@ data.frame(label = c("page1\fpage2", "bell\bhere", "vert\vtab"))
     let result = execute(&ExecutionRequest::new(CodeLanguage::R, code)).expect("execution failed");
     assert!(result.success);
     assert_eq!(result.tables.len(), 1);
-    assert_eq!(
-        result.tables[0].rows,
-        vec![
-            vec!["page1\x0cpage2"],
-            vec!["bell\x08here"],
-            vec!["vert\x0btab"],
-        ]
-    );
+    assert_eq!(result.tables[0].rows, vec![vec!["page1\x0cpage2"], vec!["bell\x08here"], vec!["vert\x0btab"],]);
 }
 
 #[cfg(unix)]
@@ -645,15 +549,9 @@ fn test_scratch_dir_permissions() {
 #[test]
 fn test_substitute_markers_single_pass() {
     let template = "START __TABLES__ MIDDLE __PLOT_SETUP__ END";
-    let replacements = [
-        ("__TABLES__", "tbl_path_with___PLOT_SETUP___inside"),
-        ("__PLOT_SETUP__", "setup_code"),
-    ];
+    let replacements = [("__TABLES__", "tbl_path_with___PLOT_SETUP___inside"), ("__PLOT_SETUP__", "setup_code")];
     let result = substitute_markers(template, &replacements);
-    assert_eq!(
-        result,
-        "START tbl_path_with___PLOT_SETUP___inside MIDDLE setup_code END"
-    );
+    assert_eq!(result, "START tbl_path_with___PLOT_SETUP___inside MIDDLE setup_code END");
 }
 
 #[test]
@@ -671,9 +569,7 @@ wc_table(df)
     assert!(res.success, "stderr: {}", res.stderr);
     assert_eq!(res.tables.len(), 1);
     assert_eq!(res.tables[0].rows.len(), 2);
-    assert!(
-        res.tables[0].rows[0][0].contains('\u{fffd}') || res.tables[0].rows[0][0].contains('?')
-    );
+    assert!(res.tables[0].rows[0][0].contains('\u{fffd}') || res.tables[0].rows[0][0].contains('?'));
     assert_eq!(res.tables[0].rows[1][0], "valid");
 }
 
@@ -789,11 +685,7 @@ matrix(1:4, nrow = 2)
     assert_eq!(res.tables.len(), 1);
     assert_eq!(res.tables[0].headers, vec!["V1", "V2"]);
     assert_eq!(res.tables[0].rows, vec![vec!["1", "3"], vec!["2", "4"]]);
-    assert!(
-        res.stdout.is_empty(),
-        "expected empty stdout, got: {}",
-        res.stdout
-    );
+    assert!(res.stdout.is_empty(), "expected empty stdout, got: {}", res.stdout);
 }
 
 #[test]
@@ -810,10 +702,7 @@ wc_table(m)
     assert!(res.success, "stderr: {}", res.stderr);
     assert_eq!(res.tables.len(), 1);
     assert_eq!(res.tables[0].headers, vec!["", "c1", "c2"]);
-    assert_eq!(
-        res.tables[0].rows,
-        vec![vec!["r1", "1", "3"], vec!["r2", "2", "4"]]
-    );
+    assert_eq!(res.tables[0].rows, vec![vec!["r1", "1", "3"], vec!["r2", "2", "4"]]);
 }
 
 #[test]
@@ -955,10 +844,7 @@ df
     assert!(res.success, "stderr: {}", res.stderr);
     assert_eq!(res.tables.len(), 1);
     assert_eq!(res.tables[0].headers, vec!["val"]);
-    assert_eq!(
-        res.tables[0].rows,
-        vec![vec!["1"], vec!["2"], vec!["3"], vec!["4"]]
-    );
+    assert_eq!(res.tables[0].rows, vec![vec!["1"], vec!["2"], vec!["3"], vec!["4"]]);
 }
 
 #[test]
@@ -1060,15 +946,8 @@ fn r_empty_dataframe_declined_by_capture_is_printed_to_stdout() {
     let req = ExecutionRequest::new(CodeLanguage::R, code);
     let res = execute(&req).expect("execution should succeed");
     assert!(res.success, "stderr: {}", res.stderr);
-    assert!(
-        res.tables.is_empty(),
-        "empty data frame must not be stored in tables"
-    );
-    assert!(
-        res.stdout.contains("data frame") || res.stdout.contains("0"),
-        "declined empty data frame must be printed to stdout: {}",
-        res.stdout
-    );
+    assert!(res.tables.is_empty(), "empty data frame must not be stored in tables");
+    assert!(res.stdout.contains("data frame") || res.stdout.contains("0"), "declined empty data frame must be printed to stdout: {}", res.stdout);
 }
 
 #[test]
@@ -1085,11 +964,7 @@ fn r_tables_beyond_capacity_are_printed_to_stdout() {
     let res = execute(&req).expect("execution should succeed");
     assert!(res.success, "stderr: {}", res.stderr);
     assert_eq!(res.tables.len(), 16, "exactly 16 tables should be captured");
-    assert!(
-        res.stdout.contains("tbl_id") && res.stdout.contains("17"),
-        "the 17th declined table must be printed to stdout: {}",
-        res.stdout
-    );
+    assert!(res.stdout.contains("tbl_id") && res.stdout.contains("17"), "the 17th declined table must be printed to stdout: {}", res.stdout);
 }
 
 #[test]
@@ -1097,10 +972,7 @@ fn table_payload_concurrent_growth_beyond_limit_is_rejected() {
     let unique_id = format!(
         "wordcraft-tables-grow-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
     );
     let dir = std::env::temp_dir().join(unique_id);
     create_scratch_dir(&dir).expect("create scratch dir");
@@ -1116,28 +988,17 @@ fn table_payload_concurrent_growth_beyond_limit_is_rejected() {
 
     // Concurrently grow the file beyond the MAX_TABLES_FILE_BYTES limit.
     // set_len expands the file metadata/content instantly without disk thrashing.
-    let grow_file = fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .expect("open for writing");
-    grow_file
-        .set_len(MAX_TABLES_FILE_BYTES + 1024)
-        .expect("expand file past limit");
+    let grow_file = fs::OpenOptions::new().write(true).open(&path).expect("open for writing");
+    grow_file.set_len(MAX_TABLES_FILE_BYTES + 1024).expect("expand file past limit");
 
     // Re-reading from the concurrently expanded file handle must reject the oversized payload
     // without reading beyond MAX_TABLES_FILE_BYTES + 1 bytes.
     let result = read_tables_from_reader(file, MAX_TABLES_FILE_BYTES, MAX_TOTAL_CELLS);
-    assert!(
-        result.is_empty(),
-        "concurrently grown file exceeding byte limit must be rejected"
-    );
+    assert!(result.is_empty(), "concurrently grown file exceeding byte limit must be rejected");
 
     // Also verify that read_tables on the path directly rejects it.
     let path_result = read_tables(&path);
-    assert!(
-        path_result.is_empty(),
-        "oversized file must be rejected by read_tables"
-    );
+    assert!(path_result.is_empty(), "oversized file must be rejected by read_tables");
 }
 
 #[test]
@@ -1145,10 +1006,7 @@ fn table_payload_ragged_zip_bomb_memory_amplification_is_rejected() {
     let unique_id = format!(
         "wordcraft-tables-zipbomb-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
     );
     let dir = std::env::temp_dir().join(unique_id);
     create_scratch_dir(&dir).expect("create scratch dir");
@@ -1160,19 +1018,12 @@ fn table_payload_ragged_zip_bomb_memory_amplification_is_rejected() {
     // Without the projection check, padding would allocate 256,000 String slots.
     let headers: Vec<String> = (0..256).map(|i| format!("\"c{i}\"")).collect();
     let empty_rows: Vec<&str> = vec!["[]"; 1_000];
-    let payload = format!(
-        r#"{{"tables":[{{"headers":[{}],"rows":[{}]}}]}}"#,
-        headers.join(","),
-        empty_rows.join(",")
-    );
+    let payload = format!(r#"{{"tables":[{{"headers":[{}],"rows":[{}]}}]}}"#, headers.join(","), empty_rows.join(","));
 
     fs::write(&path, payload).expect("write zip bomb payload");
 
     let tables = read_tables(&path);
-    assert!(
-        tables.is_empty(),
-        "payload exceeding aggregate cell projection budget must be rejected before padding"
-    );
+    assert!(tables.is_empty(), "payload exceeding aggregate cell projection budget must be rejected before padding");
 }
 
 #[test]
@@ -1185,10 +1036,7 @@ fn read_tables_from_reader_rejects_payload_with_extra_byte_beyond_limit() {
     data.resize(small_limit + 1, b' ');
     let reader = Cursor::new(data);
     let result = read_tables_from_reader(reader, small_limit as u64, MAX_TOTAL_CELLS);
-    assert!(
-        result.is_empty(),
-        "payload with extra byte beyond limit must be rejected"
-    );
+    assert!(result.is_empty(), "payload with extra byte beyond limit must be rejected");
 }
 
 #[test]
@@ -1197,11 +1045,7 @@ fn r_grid_plot_capture() {
         return;
     }
     let has_ggplot2 = Command::new(CodeLanguage::R.binary_name())
-        .args([
-            "--vanilla",
-            "-e",
-            "quit(status = if (requireNamespace('ggplot2', quietly = TRUE)) 0L else 1L)",
-        ])
+        .args(["--vanilla", "-e", "quit(status = if (requireNamespace('ggplot2', quietly = TRUE)) 0L else 1L)"])
         .status()
         .map(|status| status.success())
         .unwrap_or(false);
@@ -1221,10 +1065,7 @@ print(
     let result = execute(&req).expect("execution failed");
 
     assert!(result.success);
-    assert!(
-        result.plot_png.is_some(),
-        "grid-based plots (ggplot2, lattice) must be captured too"
-    );
+    assert!(result.plot_png.is_some(), "grid-based plots (ggplot2, lattice) must be captured too");
 }
 
 #[test]
@@ -1235,17 +1076,10 @@ fn execution_directory_is_removed_after_execution() {
 
     // The snippet leaves an extra file behind, as the ingestion template does.
     let code = "import os\nprint(os.getcwd())\nopen('extra-output.csv', 'w').write('x')\n";
-    let result =
-        execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
 
     assert!(result.success, "stderr: {}", result.stderr);
     let directory = result.stdout.trim();
-    assert!(
-        directory.contains("wordcraft_"),
-        "unexpected working directory: {directory}"
-    );
-    assert!(
-        !std::path::Path::new(directory).exists(),
-        "temporary directory was left behind: {directory}"
-    );
+    assert!(directory.contains("wordcraft_"), "unexpected working directory: {directory}");
+    assert!(!std::path::Path::new(directory).exists(), "temporary directory was left behind: {directory}");
 }
