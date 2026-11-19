@@ -17,7 +17,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -278,8 +279,6 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     let plot_png_path = temp_dir.join("__wordcraft_plot__.png");
     let plot_svg_path = temp_dir.join("__wordcraft_plot__.svg");
     let script_file = temp_dir.join(format!("script.{}", request.language.extension()));
-    let stdout_path = temp_dir.join("__wordcraft_stdout__.log");
-    let stderr_path = temp_dir.join("__wordcraft_stderr__.log");
     let plot_format = request.effective_plot_format();
 
     let wrapped_code = prepare_wrapped_code(
@@ -297,15 +296,16 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     let mut cmd = Command::new(&binary);
     cmd.arg(&script_file);
     cmd.stdin(Stdio::null());
-    // Capture to files rather than pipes: a full pipe buffer cannot block the
-    // interpreter, output written before a timeout survives, and no reader
-    // threads are left behind when a descendant keeps an inherited handle open.
-    cmd.stdout(Stdio::from(create_capture_file(&stdout_path).map_err(
-        |e| KernelError::Io(format!("create {}: {e}", stdout_path.display())),
-    )?));
-    cmd.stderr(Stdio::from(create_capture_file(&stderr_path).map_err(
-        |e| KernelError::Io(format!("create {}: {e}", stderr_path.display())),
-    )?));
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    // Run the interpreter in its own process group so descendants holding the
+    // capture pipes can be stopped before the readers are joined.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     if let Some(ref dir) = request.working_dir {
         cmd.current_dir(dir);
@@ -328,17 +328,44 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
         .spawn()
         .map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?;
 
+    let capture_limit = usize::try_from(MAX_CAPTURE_BYTES).unwrap_or(usize::MAX);
+    let (stdout_sink, stdout_done) = match child.stdout.take() {
+        Some(pipe) => {
+            let (sink, done) = spawn_capture(pipe, capture_limit);
+            (sink, Some(done))
+        }
+        None => (CaptureSink::new(), None),
+    };
+    let (stderr_sink, stderr_done) = match child.stderr.take() {
+        Some(pipe) => {
+            let (sink, done) = spawn_capture(pipe, capture_limit);
+            (sink, Some(done))
+        }
+        None => (CaptureSink::new(), None),
+    };
+
     let outcome = wait_with_timeout(
         &mut child,
         Duration::from_millis(request.timeout_ms),
-        &stdout_path,
-        &stderr_path,
+        &stdout_sink,
+        &stderr_sink,
     );
     let duration_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
-    let (stdout, stdout_truncated) = read_capture(&stdout_path, MAX_CAPTURE_BYTES);
-    let (stderr, stderr_truncated) = read_capture(&stderr_path, MAX_CAPTURE_BYTES);
-    let output_truncated = outcome.output_limited || stdout_truncated || stderr_truncated;
+    // Close inherited pipe writers before joining the readers.
+    stop_process_tree(&mut child);
+    let drain_timeout = Duration::from_secs(2);
+    if let Some(done) = stdout_done {
+        let _ = done.recv_timeout(drain_timeout);
+    }
+    if let Some(done) = stderr_done {
+        let _ = done.recv_timeout(drain_timeout);
+    }
+
+    let stdout = stdout_sink.text();
+    let stderr = stderr_sink.text();
+    let output_truncated =
+        outcome.output_limited || stdout_sink.is_truncated() || stderr_sink.is_truncated();
 
     let mut plot_png = None;
     if request.capture_plots && plot_format.captures_png() && plot_png_path.is_file() {
@@ -424,30 +451,71 @@ impl Drop for TempWorkspace {
     }
 }
 
-/// Create an owner-only capture file for a child stream.
-fn create_capture_file(path: &Path) -> std::io::Result<fs::File> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)
+/// Bounded capture buffer filled by a reader thread.
+#[derive(Clone)]
+struct CaptureSink {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    truncated: Arc<AtomicBool>,
 }
 
-/// Read at most `limit` bytes from a capture file.
+impl CaptureSink {
+    fn new() -> Self {
+        Self {
+            bytes: Arc::new(Mutex::new(Vec::new())),
+            truncated: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn is_truncated(&self) -> bool {
+        self.truncated.load(Ordering::Relaxed)
+    }
+
+    fn text(&self) -> String {
+        let bytes = self
+            .bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+/// Drain a child stream into a capped buffer.
 ///
-/// Returns the decoded text and whether more bytes were written than kept.
-fn read_capture(path: &Path, limit: u64) -> (String, bool) {
-    let Ok(file) = fs::File::open(path) else {
-        return (String::new(), false);
-    };
-    let mut bytes = Vec::new();
-    let _ = file.take(limit.saturating_add(1)).read_to_end(&mut bytes);
-    let truncated = bytes.len() as u64 > limit;
-    bytes.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-    (String::from_utf8_lossy(&bytes).into_owned(), truncated)
+/// Once `limit` bytes are kept, the read end is dropped so further writes fail
+/// instead of growing the capture.
+fn spawn_capture<R>(mut pipe: R, limit: usize) -> (CaptureSink, std::sync::mpsc::Receiver<()>)
+where
+    R: Read + Send + 'static,
+{
+    let sink = CaptureSink::new();
+    let thread_sink = sink.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    let mut bytes = thread_sink
+                        .bytes
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let remaining = limit.saturating_sub(bytes.len());
+                    if read > remaining {
+                        bytes.extend_from_slice(&chunk[..remaining]);
+                        drop(bytes);
+                        thread_sink.truncated.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = done_tx.send(());
+    });
+    (sink, done_rx)
 }
 
 struct WaitOutcome {
@@ -456,12 +524,12 @@ struct WaitOutcome {
     output_limited: bool,
 }
 
-/// Wait for the child, killing it on timeout or when capture exceeds its limit.
+/// Wait for the child, killing it on timeout or when a capture hits its limit.
 fn wait_with_timeout(
     child: &mut Child,
     timeout: Duration,
-    stdout_path: &Path,
-    stderr_path: &Path,
+    stdout_sink: &CaptureSink,
+    stderr_sink: &CaptureSink,
 ) -> WaitOutcome {
     let start = Instant::now();
     let step = Duration::from_millis(10);
@@ -477,15 +545,14 @@ fn wait_with_timeout(
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    stop_process_tree(child);
                     return WaitOutcome {
                         status: None,
                         timed_out: true,
-                        output_limited: false,
+                        output_limited: stdout_sink.is_truncated() || stderr_sink.is_truncated(),
                     };
                 }
-                if capture_limit_reached(stdout_path, stderr_path, MAX_CAPTURE_BYTES) {
+                if stdout_sink.is_truncated() || stderr_sink.is_truncated() {
                     if let Ok(Some(status)) = child.try_wait() {
                         return WaitOutcome {
                             status: Some(status),
@@ -493,8 +560,7 @@ fn wait_with_timeout(
                             output_limited: true,
                         };
                     }
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    stop_process_tree(child);
                     return WaitOutcome {
                         status: None,
                         timed_out: false,
@@ -504,8 +570,7 @@ fn wait_with_timeout(
                 std::thread::sleep(step);
             }
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_process_tree(child);
                 return WaitOutcome {
                     status: None,
                     timed_out: false,
@@ -516,14 +581,20 @@ fn wait_with_timeout(
     }
 }
 
-fn capture_limit_reached(stdout_path: &Path, stderr_path: &Path, limit: u64) -> bool {
-    capture_len(stdout_path) > limit || capture_len(stderr_path) > limit
-}
-
-fn capture_len(path: &Path) -> u64 {
-    fs::metadata(path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0)
+/// Stop the interpreter and any descendants sharing its process group.
+fn stop_process_tree(child: &mut Child) {
+    let pid = child.id();
+    #[cfg(unix)]
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(format!("-{pid}"))
+        .status();
+    #[cfg(windows)]
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Whether `content` is a non-trivial and complete SVG document.
