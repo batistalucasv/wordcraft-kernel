@@ -52,6 +52,7 @@ impl CaptureSink {
 
 struct WaitOutcome {
     status: Option<ExitStatus>,
+    exited: bool,
     timed_out: bool,
     output_limited: bool,
     interrupted: bool,
@@ -97,20 +98,6 @@ impl ManagedChild {
             Self::Windows(child) => child.inner().stderr.take(),
             #[cfg(not(any(unix, windows)))]
             Self::Other(child) => child.stderr.take(),
-        }
-    }
-
-    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        match self {
-            #[cfg(unix)]
-            Self::Unix(child) => child.try_wait(),
-            // Poll the leader only: `GroupChild::try_wait` also drains the job
-            // completion port, and cleanup needs its notification to wait for
-            // the job's workers afterwards.
-            #[cfg(windows)]
-            Self::Windows(child) => child.inner().try_wait(),
-            #[cfg(not(any(unix, windows)))]
-            Self::Other(child) => child.try_wait(),
         }
     }
 
@@ -296,10 +283,18 @@ fn execute_child(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
 
+    // A peeking platform observed the exit without reaping it, so the status only
+    // becomes available after cleanup has signalled the group and reaped it.
+    let status = match (outcome.status, outcome.exited) {
+        (Some(status), _) => Some(status),
+        (None, true) => Some(child.wait()?),
+        (None, false) => None,
+    };
+
     Ok(SupervisorResult {
         stdout,
         stderr,
-        status: outcome.status,
+        status,
         timed_out: outcome.timed_out,
         output_truncated: outcome.output_limited
             || stdout_sink.is_truncated()
@@ -397,6 +392,46 @@ fn join_capture_reader(reader: JoinHandle<io::Result<()>>) -> io::Result<()> {
     }
 }
 
+/// Report whether the child exited, without reaping it where the platform
+/// supports peeking.
+///
+/// The interpreter's process group has to be signalled while the leader still
+/// holds its PGID, so the reap waits until cleanup runs. Linux keeps reaping
+/// eagerly because its subreaper cleanup already owns the descendants.
+fn observe_exit(child: &mut ManagedChild) -> io::Result<(bool, Option<ExitStatus>)> {
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+
+        let raw = i32::try_from(child.id()).map_err(io::Error::other)?;
+        let pid = Pid::from_raw(raw).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid interpreter pid")
+        })?;
+        let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+        match waitid(WaitId::Pid(pid), options) {
+            Ok(Some(_)) => Ok((true, None)),
+            Ok(None) => Ok((false, None)),
+            Err(rustix::io::Errno::CHILD) => Ok((true, None)),
+            Err(error) => Err(io::Error::other(error)),
+        }
+    }
+    #[cfg(not(all(unix, not(target_os = "linux"))))]
+    {
+        // Poll the leader only on Windows: `GroupChild::try_wait` also drains
+        // the job completion port, and cleanup needs its notification to wait
+        // for the job's workers afterwards.
+        let status = match child {
+            #[cfg(unix)]
+            ManagedChild::Unix(child) => child.try_wait(),
+            #[cfg(windows)]
+            ManagedChild::Windows(child) => child.inner().try_wait(),
+            #[cfg(not(any(unix, windows)))]
+            ManagedChild::Other(child) => child.try_wait(),
+        }?;
+        Ok((status.is_some(), status))
+    }
+}
+
 fn wait_with_timeout(
     child: &mut ManagedChild,
     timeout: Duration,
@@ -406,9 +441,11 @@ fn wait_with_timeout(
 ) -> io::Result<WaitOutcome> {
     let start = Instant::now();
     loop {
-        if let Some(status) = child.try_wait()? {
+        let (exited, status) = observe_exit(child)?;
+        if exited {
             return Ok(WaitOutcome {
-                status: Some(status),
+                status,
+                exited: true,
                 timed_out: false,
                 output_limited: false,
                 interrupted: false,
@@ -417,6 +454,7 @@ fn wait_with_timeout(
         if cancelled.load(Ordering::Acquire) {
             return Ok(WaitOutcome {
                 status: None,
+                exited: false,
                 timed_out: false,
                 output_limited: stdout_sink.is_truncated() || stderr_sink.is_truncated(),
                 interrupted: true,
@@ -425,14 +463,17 @@ fn wait_with_timeout(
         if start.elapsed() >= timeout {
             return Ok(WaitOutcome {
                 status: None,
+                exited: false,
                 timed_out: true,
                 output_limited: stdout_sink.is_truncated() || stderr_sink.is_truncated(),
                 interrupted: false,
             });
         }
         if stdout_sink.is_truncated() || stderr_sink.is_truncated() {
+            let (exited, status) = observe_exit(child)?;
             return Ok(WaitOutcome {
-                status: child.try_wait()?,
+                status,
+                exited,
                 timed_out: false,
                 output_limited: true,
                 interrupted: false,

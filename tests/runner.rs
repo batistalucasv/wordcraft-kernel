@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::process::Stdio;
 
 use wordcraft_kernel::{
@@ -416,6 +416,40 @@ print(child.pid, flush=True)
     }
     assert!(result.success);
     assert!(!listed, "descendant remained alive");
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+#[test]
+fn python_supervisor_kills_same_group_child_after_interpreter_exits() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    let code = r#"
+import subprocess, sys
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+print(child.pid, flush=True)
+"#;
+    let req = ExecutionRequest::new(CodeLanguage::Python, code).with_plot_capture(false);
+    let result = execute(&req).expect("execution failed");
+    let child_pid = result.stdout.trim().to_string();
+
+    let alive = Command::new("kill")
+        .args(["-0", child_pid.as_str()])
+        .stderr(Stdio::null())
+        .status()
+        .expect("check test child");
+    if alive.success() {
+        let _ = Command::new("kill")
+            .args(["-KILL", child_pid.as_str()])
+            .stderr(Stdio::null())
+            .status();
+    }
+    assert!(result.success);
+    assert!(
+        !alive.success(),
+        "same-group descendant survived the interpreter's exit"
+    );
 }
 
 #[test]
