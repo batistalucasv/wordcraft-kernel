@@ -17,6 +17,7 @@ Developed specifically for research in **Ecology**, statistical data science, an
   - Configurable via `PlotFormat::Png`, `PlotFormat::Svg`, and `PlotFormat::Both`.
   - `with_prefer_svg(true)` upgrades the default PNG capture to SVG; an explicit `PlotFormat::Both` is preserved.
 - **Clean Output Streams:** Strict separation of standard output (`stdout`), standard error (`stderr`), exit codes, and elapsed execution time.
+- **Template Library:** Ready-to-run, commented ecology and statistics snippets for R and Python, described in `templates`.
 
 ---
 
@@ -78,6 +79,43 @@ fn main() {
 ```
 
 ---
+
+## Template library
+
+`wordcraft_kernel::templates` ships seven complete, commented snippets that run
+on synthetic data out of the box:
+
+| Template id | Language | Category | Packages |
+|---|---|---|---|
+| `r.shannon-simpson` | R | Diversity indices | `vegan` |
+| `r.species-accumulation` | R | Species accumulation | `vegan` |
+| `r.lm-confidence` | R | Regression | `ggplot2` |
+| `r.ttest-anova` | R | Hypothesis testing | `ggplot2` |
+| `python.data-ingest` | Python | Data ingestion | `pandas` |
+| `python.correlation-heatmap` | Python | Correlation | `pandas`, `seaborn`, `matplotlib`, `scipy` |
+| `python.lm-tests` | Python | Regression | `numpy`, `pandas`, `scipy` |
+
+Browse with `templates::all()`, `templates::find(id)`,
+`templates::by_language(...)` and `templates::by_category(...)`, then render and
+run one:
+
+```rust
+use wordcraft_kernel::{execute, templates, ExecutionRequest, KernelError};
+
+fn main() -> Result<(), KernelError> {
+    let template = templates::find("r.ttest-anova").expect("built-in template");
+    let script = template.render(&[("title", "Biomass at three sites")])?;
+    let result = execute(&ExecutionRequest::new(template.language, script))?;
+    println!("{}", result.stdout);
+    Ok(())
+}
+```
+
+Every parameter has a default, so `render_default()` always produces a runnable
+script. Values are inserted verbatim because they are code (an R expression, a
+column name, a path); quote or validate untrusted input for the target language
+before rendering. The test suite runs each snippet when its interpreter and
+listed packages are installed, and skips it with a message otherwise.
 
 ## Tabular data capture
 

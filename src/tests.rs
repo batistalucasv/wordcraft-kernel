@@ -1499,3 +1499,62 @@ fn read_tables_from_reader_rejects_payload_with_extra_byte_beyond_limit() {
         "payload with extra byte beyond limit must be rejected"
     );
 }
+
+#[test]
+fn r_grid_plot_capture() {
+    if !is_language_available(CodeLanguage::R) {
+        return;
+    }
+    let has_ggplot2 = Command::new(CodeLanguage::R.binary_name())
+        .args([
+            "--vanilla",
+            "-e",
+            "quit(status = if (requireNamespace('ggplot2', quietly = TRUE)) 0L else 1L)",
+        ])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !has_ggplot2 {
+        return;
+    }
+
+    let code = r#"
+library(ggplot2)
+print(
+  ggplot(mtcars, aes(x = wt, y = mpg)) +
+    geom_point() +
+    theme_minimal()
+)
+"#;
+    let req = ExecutionRequest::new(CodeLanguage::R, code);
+    let result = execute(&req).expect("execution failed");
+
+    assert!(result.success);
+    assert!(
+        result.plot_png.is_some(),
+        "grid-based plots (ggplot2, lattice) must be captured too"
+    );
+}
+
+#[test]
+fn execution_directory_is_removed_after_execution() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    // The snippet leaves an extra file behind, as the ingestion template does.
+    let code = "import os\nprint(os.getcwd())\nopen('extra-output.csv', 'w').write('x')\n";
+    let result =
+        execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
+
+    assert!(result.success, "stderr: {}", result.stderr);
+    let directory = result.stdout.trim();
+    assert!(
+        directory.contains("wordcraft_"),
+        "unexpected working directory: {directory}"
+    );
+    assert!(
+        !std::path::Path::new(directory).exists(),
+        "temporary directory was left behind: {directory}"
+    );
+}

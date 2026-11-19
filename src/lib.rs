@@ -3,6 +3,7 @@
 //! Provides isolated, safe subprocess execution with timeout enforcement,
 //! output capture (stdout, stderr, exit status), plot interception (PNG and vector SVG),
 //! and structured capture of tabular data (R `data.frame` and Python `pandas.DataFrame`).
+//! [`templates`] ships ready-made ecology and statistics snippets for both languages.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -11,6 +12,8 @@
     clippy::todo,
     clippy::unreachable
 )]
+
+pub mod templates;
 
 use std::fmt;
 use std::fs;
@@ -261,6 +264,18 @@ pub enum KernelError {
 
     #[error("Failed to prepare script: {0}")]
     ScriptPreparation(String),
+
+    #[error("Template '{template}' has no parameter named '{parameter}'")]
+    UnknownTemplateParameter { template: String, parameter: String },
+
+    #[error("Template '{template}' references an undefined placeholder '{placeholder}'")]
+    UndefinedPlaceholder {
+        template: String,
+        placeholder: String,
+    },
+
+    #[error("Template '{template}' has an unterminated placeholder")]
+    UnterminatedPlaceholder { template: String },
 }
 
 /// Check if the interpreter for a given language is available on the host system.
@@ -528,6 +543,7 @@ fn prepare_wrapped_code(lang: CodeLanguage, capture_plots: bool, format: PlotFor
                 PlotFormat::Png => (
                     r#"  has_plot <- FALSE
   setHook("plot.new", function() { has_plot <<- TRUE; assign(".wc_has_plot", TRUE, envir = .GlobalEnv) })
+  # ggplot2 and lattice draw through grid, which never fires the plot.new hook.
   setHook("grid.newpage", function() { has_plot <<- TRUE; assign(".wc_has_plot", TRUE, envir = .GlobalEnv) })
   png(plot_png, width = 1600, height = 1200, res = 200)
 "#
@@ -542,6 +558,7 @@ fn prepare_wrapped_code(lang: CodeLanguage, capture_plots: bool, format: PlotFor
                 PlotFormat::Svg => (
                     r#"  has_plot <- FALSE
   setHook("plot.new", function() { has_plot <<- TRUE; assign(".wc_has_plot", TRUE, envir = .GlobalEnv) })
+  # ggplot2 and lattice draw through grid, which never fires the plot.new hook.
   setHook("grid.newpage", function() { has_plot <<- TRUE; assign(".wc_has_plot", TRUE, envir = .GlobalEnv) })
   svg(plot_svg, width = 8, height = 6)
 "#
@@ -595,6 +612,7 @@ fn prepare_wrapped_code(lang: CodeLanguage, capture_plots: bool, format: PlotFor
     if (!is.null(drv)) drv$set_has_plot()
   }
   setHook("plot.new", hook)
+  # ggplot2 and lattice draw through grid, which never fires the plot.new hook.
   setHook("grid.newpage", hook)
   dev.control("enable")
 "#
@@ -1144,6 +1162,9 @@ try:
 finally:
     _wc_write_tables()
 __PLOT_FINALLY__"##;
+
+#[cfg(test)]
+mod template_tests;
 
 #[cfg(test)]
 mod tests;
