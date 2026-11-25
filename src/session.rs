@@ -1465,6 +1465,29 @@ import types
 
 if os.name == "posix":
     import selectors
+elif os.name == "nt":
+    import ctypes
+    import ctypes.wintypes as _wintypes
+    import msvcrt
+    import _winapi
+
+    _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _KERNEL32.SetStdHandle.argtypes = [_wintypes.DWORD, _wintypes.HANDLE]
+    _KERNEL32.SetStdHandle.restype = _wintypes.BOOL
+    _STD_HANDLES = {
+        0: _winapi.STD_INPUT_HANDLE,
+        1: _winapi.STD_OUTPUT_HANDLE,
+        2: _winapi.STD_ERROR_HANDLE,
+    }
+
+
+def _redirect_std_fd(src_fd, dst_fd):
+    os.dup2(src_fd, dst_fd)
+    if os.name == "nt":
+        std_id = _STD_HANDLES.get(dst_fd)
+        if std_id is not None:
+            _KERNEL32.SetStdHandle(std_id, msvcrt.get_osfhandle(dst_fd))
+
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "."
 
@@ -1480,10 +1503,10 @@ PROTO_OUT = os.fdopen(PROTO_OUT_FD, "wb", buffering=0)
 
 DEVNULL_R = os.open(os.devnull, os.O_RDONLY)
 DEVNULL_W = os.open(os.devnull, os.O_WRONLY)
-os.dup2(DEVNULL_R, 0)
+_redirect_std_fd(DEVNULL_R, 0)
 os.close(DEVNULL_R)
-os.dup2(DEVNULL_W, 1)
-os.dup2(DEVNULL_W, 2)
+_redirect_std_fd(DEVNULL_W, 1)
+_redirect_std_fd(DEVNULL_W, 2)
 sys.stdin = open(os.devnull, "r", encoding="utf-8")
 
 def write_all(fd, data):
@@ -1875,9 +1898,9 @@ def main():
         err_sink = BoundedSink(err_path)
         out_read, out_write = os.pipe()
         err_read, err_write = os.pipe()
-        os.dup2(out_write, 1)
+        _redirect_std_fd(out_write, 1)
         os.close(out_write)
-        os.dup2(err_write, 2)
+        _redirect_std_fd(err_write, 2)
         os.close(err_write)
         if os.name == "posix":
             out_stop_r, out_stop_w = os.pipe()
@@ -1970,8 +1993,8 @@ def main():
             # Close the chunk's pipe write ends; child processes that inherited
             # them keep their own copies until they exit.
             try:
-                os.dup2(DEVNULL_W, 1)
-                os.dup2(DEVNULL_W, 2)
+                _redirect_std_fd(DEVNULL_W, 1)
+                _redirect_std_fd(DEVNULL_W, 2)
             except Exception:
                 pass
             # Wake POSIX selectors so a background subprocess holding the write
