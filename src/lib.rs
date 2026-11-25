@@ -8,6 +8,7 @@
 //! [`SessionManager`] runs chunks in a persistent daemon per `session_id`, so variables,
 //! imports, and environment state persist across multiple executions.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+#![forbid(unsafe_code)]
 
 pub mod templates;
 
@@ -22,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use command_group::{CommandGroup, GroupChild};
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,10 @@ use serde::{Deserialize, Serialize};
 static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Maximum bytes kept from each captured stream (stdout and stderr).
-const MAX_CAPTURE_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_CAPTURE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Maximum bytes kept from each captured plot artifact (PNG and SVG).
+pub(crate) const MAX_PLOT_BYTES: usize = 20 * 1024 * 1024;
 
 /// How long the supervisor gets to cancel the interpreter before it is killed.
 #[cfg(unix)]
@@ -332,20 +336,67 @@ pub fn is_language_available(language: CodeLanguage) -> bool {
     which_binary(language).is_some()
 }
 
+/// Check whether `path` points to a usable executable interpreter binary.
+fn is_usable_executable(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+        let Ok(sym_meta) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        let is_windows_apps = path.components().any(|component| component.as_os_str().eq_ignore_ascii_case("WindowsApps"));
+        if is_windows_apps && (sym_meta.len() == 0 || (sym_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            return false;
+        }
+    }
+
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Candidate binary names searched on `PATH` for `language`.
+fn candidate_binary_names(language: CodeLanguage) -> &'static [&'static str] {
+    match language {
+        CodeLanguage::R => &["Rscript"],
+        #[cfg(windows)]
+        CodeLanguage::Python => &["python3", "python"],
+        #[cfg(not(windows))]
+        CodeLanguage::Python => &["python3"],
+    }
+}
+
 /// Search PATH for the language's binary.
 pub fn which_binary(language: CodeLanguage) -> Option<PathBuf> {
-    let name = language.binary_name();
     let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
-        {
-            let exe_candidate = dir.join(format!("{name}.exe"));
-            if exe_candidate.is_file() {
-                return Some(exe_candidate);
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path_var).collect();
+    for name in candidate_binary_names(language) {
+        for dir in &dirs {
+            let candidate = dir.join(name);
+            if is_usable_executable(&candidate) {
+                return Some(candidate);
+            }
+            #[cfg(windows)]
+            {
+                let exe_candidate = dir.join(format!("{name}.exe"));
+                if is_usable_executable(&exe_candidate) {
+                    return Some(exe_candidate);
+                }
             }
         }
     }
@@ -369,26 +420,11 @@ pub fn execute_with_cancellation(request: &ExecutionRequest, cancelled: &AtomicB
     // entry must be resolved against this process before it is handed over.
     let binary = std::path::absolute(&binary).map_err(|error| KernelError::Io(format!("resolve interpreter {}: {error}", binary.display())))?;
 
-    let mut temp_dir = std::env::temp_dir();
-    let mut created = false;
-    for _ in 0..10 {
-        let unique_id =
-            format!("wordcraft_{}_{}_{}", std::process::id(), SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed), Instant::now().elapsed().as_nanos());
-        let candidate = std::env::temp_dir().join(&unique_id);
-        match create_scratch_dir(&candidate) {
-            Ok(()) => {
-                temp_dir = candidate;
-                created = true;
-                break;
-            }
-            Err(KernelError::Io(_)) => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    if !created {
-        return Err(KernelError::Io("failed to create exclusive scratch directory after 10 attempts".to_string()));
-    }
+    let temp_dir = create_unique_scratch_dir("wordcraft", &SCRIPT_COUNTER, 10)?;
     let _guard = TempDirGuard(&temp_dir);
+
+    let work_dir = temp_dir.join("work");
+    create_scratch_dir(&work_dir)?;
 
     let plot_png_path = temp_dir.join("__wordcraft_plot__.png");
     let plot_svg_path = temp_dir.join("__wordcraft_plot__.svg");
@@ -418,7 +454,8 @@ pub fn execute_with_cancellation(request: &ExecutionRequest, cancelled: &AtomicB
     let mut cmd = Command::new(&supervisor);
     cmd.arg("--run").arg(&binary).arg(&script_file).arg(&result_file).arg(request.timeout_ms.to_string());
     if request.language == CodeLanguage::R {
-        cmd.env("WORDCRAFT_USER_SCRIPT", &user_file)
+        cmd.arg("--pre-arg=--vanilla")
+            .env("WORDCRAFT_USER_SCRIPT", &user_file)
             .env("WORDCRAFT_TABLES_FILE", &tables_file)
             .env("WORDCRAFT_PLOT_PNG", &plot_png_path)
             .env("WORDCRAFT_PLOT_SVG", &plot_svg_path);
@@ -435,7 +472,7 @@ pub fn execute_with_cancellation(request: &ExecutionRequest, cancelled: &AtomicB
     if let Some(ref dir) = request.working_dir {
         cmd.current_dir(dir);
     } else {
-        cmd.current_dir(&temp_dir);
+        cmd.current_dir(&work_dir);
     }
 
     let mut child = cmd.group_spawn().map_err(|e| KernelError::Io(format!("spawn supervisor {}: {e}", supervisor.display())))?;
@@ -476,15 +513,12 @@ pub fn execute_with_cancellation(request: &ExecutionRequest, cancelled: &AtomicB
         output_truncated = true;
     }
 
-    let mut plot_png = None;
-    if request.capture_plots && plot_format.captures_png() && plot_png_path.is_file() {
-        plot_png =
-            fs::read(&plot_png_path).ok().filter(|bytes| bytes.len() > 64 && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]));
-    }
-
-    let mut plot_svg = None;
-    if request.capture_plots && plot_format.captures_svg() && plot_svg_path.is_file() {
-        plot_svg = fs::read_to_string(&plot_svg_path).ok().filter(|content| is_complete_svg(content));
+    let (plot_png, png_truncated) =
+        if request.capture_plots && plot_format.captures_png() { read_png_bounded(&plot_png_path, MAX_PLOT_BYTES) } else { (None, false) };
+    let (plot_svg, svg_truncated) =
+        if request.capture_plots && plot_format.captures_svg() { read_svg_bounded(&plot_svg_path, MAX_PLOT_BYTES) } else { (None, false) };
+    if png_truncated || svg_truncated {
+        output_truncated = true;
     }
 
     let tables = read_tables(&tables_file);
@@ -583,6 +617,7 @@ fn find_supervisor_binary(configured: Option<&Path>) -> Result<PathBuf, KernelEr
 
 fn wait_for_supervisor(child: &mut GroupChild, timeout: Duration, cancelled: &AtomicBool) -> std::io::Result<std::process::ExitStatus> {
     let start = std::time::Instant::now();
+    let mut poll_interval = Duration::from_millis(1);
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
@@ -590,10 +625,13 @@ fn wait_for_supervisor(child: &mut GroupChild, timeout: Duration, cancelled: &At
         if cancelled.load(Ordering::Acquire) {
             return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "execution interrupted"));
         }
-        if start.elapsed() >= timeout {
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
             return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "supervisor exceeded its cleanup deadline"));
         }
-        std::thread::sleep(Duration::from_millis(10));
+        let remaining = timeout.saturating_sub(elapsed);
+        std::thread::sleep(poll_interval.min(remaining));
+        poll_interval = (poll_interval * 2).min(Duration::from_millis(10));
     }
 }
 
@@ -712,12 +750,29 @@ fn read_supervisor_result(path: &Path) -> std::io::Result<SupervisorResult> {
     })
 }
 
+/// Whether `bytes` begins with a non-trivial PNG header.
+pub(crate) fn is_valid_png(bytes: &[u8]) -> bool {
+    bytes.len() > 64 && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+}
+
 /// Whether `content` is a non-trivial and complete SVG document.
 ///
 /// A truncated file can contain `<svg` and exceed the size threshold, so the
 /// closing root element is required to avoid returning partial output.
-fn is_complete_svg(content: &str) -> bool {
+pub(crate) fn is_complete_svg(content: &str) -> bool {
     content.len() > 64 && content.contains("<svg") && content.trim_end().ends_with("</svg>")
+}
+
+/// Shorten `s` to at most `max_bytes` bytes without splitting a character.
+pub(crate) fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if max_bytes >= s.len() {
+        return s;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &s[..boundary]
 }
 
 /// Shorten `text` to at most `limit` bytes without splitting a character.
@@ -725,16 +780,51 @@ fn truncate_output(text: &mut String, limit: usize) -> bool {
     if text.len() <= limit {
         return false;
     }
-    let mut end = limit;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = truncate_to_char_boundary(text, limit).len();
     text.truncate(end);
     true
 }
 
+/// Read up to `limit` bytes from `path`, reporting whether the file exceeded `limit`.
+pub(crate) fn read_bounded_bytes(path: &Path, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > limit;
+    if truncated {
+        bytes.truncate(limit);
+    }
+    Ok((bytes, truncated))
+}
+
+/// Read a bounded PNG plot file, returning `(None, true)` if it exceeds `limit`.
+pub(crate) fn read_png_bounded(path: &Path, limit: usize) -> (Option<Vec<u8>>, bool) {
+    let Ok((bytes, truncated)) = read_bounded_bytes(path, limit) else {
+        return (None, false);
+    };
+    if truncated {
+        return (None, true);
+    }
+    if is_valid_png(&bytes) { (Some(bytes), false) } else { (None, false) }
+}
+
+/// Read a bounded SVG plot file, returning `(None, true)` if it exceeds `limit`.
+pub(crate) fn read_svg_bounded(path: &Path, limit: usize) -> (Option<String>, bool) {
+    let Ok((bytes, truncated)) = read_bounded_bytes(path, limit) else {
+        return (None, false);
+    };
+    if truncated {
+        return (None, true);
+    }
+    let content = String::from_utf8_lossy(&bytes);
+    if content.len() > limit {
+        return (None, true);
+    }
+    if is_complete_svg(&content) { (Some(content.into_owned()), false) } else { (None, false) }
+}
+
 /// Create an owner-only directory leaf exclusively.
-fn create_scratch_dir(path: &Path) -> Result<(), KernelError> {
+pub(crate) fn create_scratch_dir(path: &Path) -> Result<(), KernelError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -746,6 +836,26 @@ fn create_scratch_dir(path: &Path) -> Result<(), KernelError> {
     {
         fs::DirBuilder::new().create(path).map_err(|e| KernelError::Io(format!("create scratch dir {}: {e}", path.display())))
     }
+}
+
+/// Create an exclusively owned temporary directory with unique PID/counter/wall-clock entropy.
+pub(crate) fn create_unique_scratch_dir(prefix: &str, counter: &AtomicU64, attempts: usize) -> Result<PathBuf, KernelError> {
+    let base_temp = {
+        let tmp = std::env::temp_dir();
+        if tmp.is_relative() { std::env::current_dir().map(|cur| cur.join(&tmp)).unwrap_or(tmp) } else { tmp }
+    };
+    let pid = std::process::id();
+    for _ in 0..attempts {
+        let seq = counter.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos()) as u64;
+        let candidate = base_temp.join(format!("{prefix}_{pid}_{seq}_{nanos:x}"));
+        match create_scratch_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(KernelError::Io(_)) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(KernelError::Io(format!("failed to create exclusive scratch directory after {attempts} attempts")))
 }
 
 /// RAII guard that removes a scratch directory and all its contents on drop.
@@ -1047,220 +1157,254 @@ struct RawTable {
 
 const R_TEMPLATE: &str = r##"options(warn = 1)
 local({
-  user_script <- Sys.getenv("WORDCRAFT_USER_SCRIPT")
-  plot_png <- Sys.getenv("WORDCRAFT_PLOT_PNG")
-  plot_svg <- Sys.getenv("WORDCRAFT_PLOT_SVG")
+  user_script <- base::Sys.getenv("WORDCRAFT_USER_SCRIPT")
+  plot_png <- base::Sys.getenv("WORDCRAFT_PLOT_PNG")
+  plot_svg <- base::Sys.getenv("WORDCRAFT_PLOT_SVG")
 
-  driver <- new.env(parent = emptyenv())
-  driver$tables_file <- Sys.getenv("WORDCRAFT_TABLES_FILE")
-  driver$tables <- list()
+  driver <- base::new.env(parent = base::emptyenv())
+  driver$tables_file <- base::Sys.getenv("WORDCRAFT_TABLES_FILE")
+  driver$tables <- base::list()
 
-  json_escape <- function(value) {
-    text <- as.character(value)
-    if (length(text) == 0L || is.na(text[1L])) {
-      return("\"\"")
+  json_escape_vec <- function(vec) {
+    if (base::length(vec) == 0L) {
+      return(base::character(0L))
     }
-    chars <- strsplit(text[1L], "", fixed = TRUE)[[1L]]
-    if (length(chars) == 0L) {
-      return("\"\"")
+    vec <- base::as.character(vec)
+    vec[base::is.na(vec)] <- ""
+    vec <- base::gsub("\\", "\\\\", vec, fixed = TRUE)
+    vec <- base::gsub("\"", "\\\"", vec, fixed = TRUE)
+    vec <- base::gsub("\b", "\\b", vec, fixed = TRUE)
+    vec <- base::gsub("\f", "\\f", vec, fixed = TRUE)
+    vec <- base::gsub("\n", "\\n", vec, fixed = TRUE)
+    vec <- base::gsub("\r", "\\r", vec, fixed = TRUE)
+    vec <- base::gsub("\t", "\\t", vec, fixed = TRUE)
+    has_ctrl <- base::tryCatch(base::grepl("[\001-\037\177]", vec, perl = TRUE), error = function(e) base::rep(TRUE, base::length(vec)))
+    if (base::any(has_ctrl)) {
+      vec[has_ctrl] <- base::vapply(vec[has_ctrl], function(s) {
+        chars <- base::strsplit(s, "", fixed = TRUE)[[1L]]
+        if (base::length(chars) == 0L) {
+          return("")
+        }
+        escaped <- base::vapply(chars, function(ch) {
+          code <- base::suppressWarnings(base::utf8ToInt(ch))
+          if (base::is.na(code)) {
+            ""
+          } else if (code < 32L || code == 127L) {
+            base::sprintf("\\u%04x", code)
+          } else {
+            ch
+          }
+        }, base::character(1L), USE.NAMES = FALSE)
+        base::paste0(escaped, collapse = "")
+      }, base::character(1L), USE.NAMES = FALSE)
     }
-    escaped <- vapply(chars, function(ch) {
-      code <- suppressWarnings(utf8ToInt(ch))
-      if (is.na(code)) {
-        ""
-      } else if (ch == "\"") {
-        "\\\""
-      } else if (ch == "\\") {
-        "\\\\"
-      } else if (ch == "\b") {
-        "\\b"
-      } else if (ch == "\f") {
-        "\\f"
-      } else if (ch == "\n") {
-        "\\n"
-      } else if (ch == "\r") {
-        "\\r"
-      } else if (ch == "\t") {
-        "\\t"
-      } else if (code < 32L || code == 127L) {
-        sprintf("\\u%04x", code)
-      } else {
-        ch
-      }
-    }, character(1), USE.NAMES = FALSE)
-    paste0("\"", paste0(escaped, collapse = ""), "\"")
+    base::paste0("\"", vec, "\"")
   }
 
   cell <- function(value, depth = 0L) {
-    if (is.null(value) || length(value) == 0L || depth > 8L) {
+    if (base::is.null(value) || base::length(value) == 0L || depth > 8L) {
       return("")
     }
-    if (is.list(value)) {
+    if (base::is.list(value)) {
       return(cell(value[[1L]], depth + 1L))
     }
-    if (length(value) > 1L) {
+    if (base::length(value) > 1L) {
       value <- value[1L]
     }
-    if (is.na(value)) {
+    if (base::is.na(value)) {
       return("NA")
     }
-    if (is.factor(value)) {
-      text <- tryCatch(as.character(value), error = function(e) "")
-      if (length(text) == 0L || is.na(text[1L])) {
+    if (base::is.factor(value)) {
+      text <- base::tryCatch(base::as.character(value), error = function(e) "")
+      if (base::length(text) == 0L || base::is.na(text[1L])) {
         return("NA")
       }
-      return(substr(text[1L], 1L, 4096L))
+      return(base::substr(text[1L], 1L, 4096L))
     }
-    text <- tryCatch(as.character(value), error = function(e) "")
-    if (length(text) == 0L || is.na(text[1L])) {
+    text <- base::tryCatch(base::as.character(value), error = function(e) "")
+    if (base::length(text) == 0L || base::is.na(text[1L])) {
       return("")
     }
-    substr(text[1L], 1L, 4096L)
+    base::substr(text[1L], 1L, 4096L)
+  }
+
+  format_col <- function(column, count) {
+    if (count <= 0L) {
+      return(base::character(0L))
+    }
+    if (base::is.list(column)) {
+      return(base::vapply(base::seq_len(count), function(i) cell(column[[i]]), base::character(1L), USE.NAMES = FALSE))
+    }
+    slice <- base::tryCatch(column[base::seq_len(count)], error = function(e) NULL)
+    if (base::is.null(slice) || base::length(slice) != count) {
+      return(base::vapply(base::seq_len(count), function(i) cell(column[i]), base::character(1L), USE.NAMES = FALSE))
+    }
+    text <- base::tryCatch(base::as.character(slice), error = function(e) NULL)
+    if (base::is.null(text) || base::length(text) != count) {
+      return(base::vapply(base::seq_len(count), function(i) cell(slice[i]), base::character(1L), USE.NAMES = FALSE))
+    }
+    na_mask <- base::tryCatch(base::is.na(slice), error = function(e) base::is.na(text))
+    if (base::length(na_mask) != count) {
+      na_mask <- base::is.na(text)
+    }
+    na_mask <- na_mask | base::is.na(text)
+    text <- base::substr(text, 1L, 4096L)
+    text[na_mask] <- "NA"
+    text
   }
 
   capture <- function(value) {
-    if (length(driver$tables) >= 16L) {
-      return(invisible(FALSE))
+    if (base::length(driver$tables) >= 16L) {
+      return(base::invisible(FALSE))
     }
-    if (!is.data.frame(value) && !is.matrix(value)) {
-      return(invisible(FALSE))
+    if (!base::is.data.frame(value) && !base::is.matrix(value)) {
+      return(base::invisible(FALSE))
     }
-    count <- min(nrow(value), 10000L)
+    count <- base::min(base::nrow(value), 10000L)
 
     has_labels <- FALSE
     labels <- NULL
-    if (is.matrix(value)) {
-      rn_mat <- rownames(value)
-      if (!is.null(rn_mat)) {
-        retained_labels <- as.character(rn_mat[seq_len(count)])
-        has_labels <- !identical(retained_labels, as.character(seq_len(count)))
+    if (base::is.matrix(value)) {
+      rn_mat <- base::rownames(value)
+      if (!base::is.null(rn_mat)) {
+        retained_labels <- base::as.character(rn_mat[base::seq_len(count)])
+        has_labels <- !base::identical(retained_labels, base::as.character(base::seq_len(count)))
         labels <- retained_labels
       }
     } else {
-      if (.row_names_info(value, 1L) > 0L) {
-        rn_df <- .row_names_info(value, 0L)
-        is_compact <- is.integer(rn_df) && length(rn_df) == 2L && is.na(rn_df[1L])
+      if (base::.row_names_info(value, 1L) > 0L) {
+        rn_df <- base::.row_names_info(value, 0L)
+        is_compact <- base::is.integer(rn_df) && base::length(rn_df) == 2L && base::is.na(rn_df[1L])
         if (!is_compact) {
-          retained_labels <- as.character(rn_df[seq_len(count)])
-          has_labels <- !identical(retained_labels, as.character(seq_len(count)))
+          retained_labels <- base::as.character(rn_df[base::seq_len(count)])
+          has_labels <- !base::identical(retained_labels, base::as.character(base::seq_len(count)))
           labels <- retained_labels
         }
       }
     }
 
     max_cols <- if (has_labels) 255L else 256L
-    cols_count <- min(ncol(value), max_cols)
+    cols_count <- base::min(base::ncol(value), max_cols)
     if (cols_count == 0L && !has_labels) {
-      return(invisible(FALSE))
+      return(base::invisible(FALSE))
     }
 
-    raw_headers <- if (is.matrix(value)) colnames(value) else names(value)
-    df <- if (is.matrix(value)) {
-      base::as.data.frame(value[seq_len(count), seq_len(cols_count), drop = FALSE])
+    raw_headers <- if (base::is.matrix(value)) base::colnames(value) else base::names(value)
+    df <- if (base::is.matrix(value)) {
+      base::as.data.frame(value[base::seq_len(count), base::seq_len(cols_count), drop = FALSE])
     } else {
       base::as.data.frame(value)
     }
-    if (is.null(raw_headers) || length(raw_headers) < cols_count) {
-      raw_headers <- names(df)
+    if (base::is.null(raw_headers) || base::length(raw_headers) < cols_count) {
+      raw_headers <- base::names(df)
     }
-    if (is.null(raw_headers)) {
-      raw_headers <- rep("", cols_count)
+    if (base::is.null(raw_headers)) {
+      raw_headers <- base::rep("", cols_count)
     }
-    headers <- raw_headers[seq_len(cols_count)]
-    headers <- vapply(headers, function(h) substr(as.character(h), 1L, 4096L), character(1), USE.NAMES = FALSE)
+    headers <- raw_headers[base::seq_len(cols_count)]
+    headers <- base::substr(base::as.character(headers), 1L, 4096L)
+    headers[base::is.na(headers)] <- ""
 
     if (has_labels) {
       headers <- c("", headers)
     }
-    rows <- vector("list", count)
-    df_sub <- df[seq_len(cols_count)]
-    for (index in seq_len(count)) {
-      cells <- if (cols_count > 0L) {
-        vapply(df_sub, function(column) cell(column[index]), character(1), USE.NAMES = FALSE)
-      } else {
-        character(0)
-      }
-      if (has_labels) {
-        cells <- c(cell(labels[index]), cells)
-      }
-      rows[[index]] <- cells
+    cols <- base::list()
+    if (has_labels) {
+      cols[[1L]] <- format_col(labels, count)
     }
-    driver$tables[[length(driver$tables) + 1L]] <- list(headers = as.list(headers), rows = rows)
-    invisible(TRUE)
+    if (cols_count > 0L) {
+      df_sub <- df[base::seq_len(cols_count)]
+      for (col_idx in base::seq_len(cols_count)) {
+        cols[[base::length(cols) + 1L]] <- format_col(df_sub[[col_idx]], count)
+      }
+    }
+    driver$tables[[base::length(driver$tables) + 1L]] <- base::list(headers = headers, cols = cols, nrows = count)
+    base::invisible(TRUE)
   }
 
   write_tables <- function() {
-    if (length(driver$tables) == 0L) {
-      return(invisible(NULL))
+    if (base::length(driver$tables) == 0L) {
+      return(base::invisible(NULL))
     }
-    max_budget <- if (exists(".wc_budget", envir = globalenv())) get(".wc_budget", envir = globalenv()) else 65011712L
-    tryCatch({
+    max_budget <- 65011712L
+    if (base::exists(".wc_budget", envir = base::globalenv(), inherits = FALSE)) {
+      candidate <- base::get(".wc_budget", envir = base::globalenv(), inherits = FALSE)
+      if (base::is.numeric(candidate) && base::length(candidate) == 1L && base::is.finite(candidate) && candidate > 0 && candidate <= 65011712) {
+        max_budget <- base::as.integer(candidate)
+      }
+    }
+    base::tryCatch({
       con <- base::file(driver$tables_file, open = "wt", encoding = "UTF-8")
-      tryCatch({
-        cat("{\"tables\":[", file = con, sep = "")
+      base::tryCatch({
+        base::cat("{\"tables\":[", file = con, sep = "")
         bytes_written <- 11L
         table_written <- 0L
         closing_reserve <- 4L
 
         for (table in driver$tables) {
-          headers <- vapply(table$headers, json_escape, character(1), USE.NAMES = FALSE)
-          h_json <- paste0("[", paste0(headers, collapse = ","), "]")
-          prefix <- paste0(if (table_written > 0L) "," else "", "{\"headers\":", h_json, ",\"rows\":[")
-          prefix_bytes <- nchar(prefix, type = "bytes")
+          headers <- json_escape_vec(table$headers)
+          h_json <- base::paste0("[", base::paste0(headers, collapse = ","), "]")
+          prefix <- base::paste0(if (table_written > 0L) "," else "", "{\"headers\":", h_json, ",\"rows\":[")
+          prefix_bytes <- base::nchar(prefix, type = "bytes")
           if (bytes_written + prefix_bytes + closing_reserve > max_budget) {
             break
           }
-          cat(prefix, file = con, sep = "")
+          base::cat(prefix, file = con, sep = "")
           bytes_written <- bytes_written + prefix_bytes
           table_written <- table_written + 1L
-          row_written <- 0L
 
-          for (row in table$rows) {
-            cells <- vapply(row, json_escape, character(1), USE.NAMES = FALSE)
-            r_json <- paste0("[", paste0(cells, collapse = ","), "]")
-            r_str <- paste0(if (row_written > 0L) "," else "", r_json)
-            r_bytes <- nchar(r_str, type = "bytes")
-            if (bytes_written + r_bytes + closing_reserve > max_budget) {
-              break
+          if (table$nrows > 0L && base::length(table$cols) > 0L) {
+            escaped_cols <- base::lapply(table$cols, json_escape_vec)
+            row_jsons <- base::paste0("[", base::do.call(base::paste, base::c(escaped_cols, base::list(sep = ","))), "]")
+            row_bytes <- base::nchar(row_jsons, type = "bytes")
+            if (base::length(row_bytes) > 1L) {
+              row_bytes[-1L] <- row_bytes[-1L] + 1L
             }
-            cat(r_str, file = con, sep = "")
-            bytes_written <- bytes_written + r_bytes
-            row_written <- row_written + 1L
+            cum_bytes <- bytes_written + base::cumsum(row_bytes) + closing_reserve
+            keep <- base::sum(cum_bytes <= max_budget)
+            if (keep > 0L) {
+              base::cat(base::paste0(row_jsons[base::seq_len(keep)], collapse = ","), file = con, sep = "")
+              bytes_written <- bytes_written + base::sum(row_bytes[base::seq_len(keep)])
+            }
           }
-          cat("]}", file = con, sep = "")
+          base::cat("]}", file = con, sep = "")
           bytes_written <- bytes_written + 2L
           if (bytes_written + 2L > max_budget) {
             break
           }
         }
-        cat("]}\n", file = con, sep = "")
+        base::cat("]}\n", file = con, sep = "")
       }, finally = {
-        try(base::close(con), silent = TRUE)
+        base::try(base::close(con), silent = TRUE)
       })
-    }, error = function(e) invisible(NULL))
-    invisible(NULL)
+    }, error = function(e) base::invisible(NULL))
+    base::invisible(NULL)
   }
 
-  assign("wc_table", function(value) {
-    if (!is.data.frame(value) && !is.matrix(value)) {
-      stop("wc_table() expects a data.frame or matrix")
+  base::assign("wc_table", function(value) {
+    if (!base::is.data.frame(value) && !base::is.matrix(value)) {
+      base::stop("wc_table() expects a data.frame or matrix")
     }
     capture(value)
-    invisible(value)
-  }, envir = globalenv())
+    base::invisible(value)
+  }, envir = base::globalenv())
 
-  expressions <- parse(file = user_script, encoding = "UTF-8", keep.source = FALSE)
+  expressions <- base::parse(file = user_script, encoding = "UTF-8", keep.source = FALSE)
 
 __PLOT_SETUP__
 
-  tryCatch({
+  base::tryCatch({
     for (expr in expressions) {
-      result <- base::withVisible(base::eval(expr, envir = globalenv()))
+      result <- base::withVisible(base::eval(expr, envir = base::globalenv()))
       base::assign(".Last.value", result$value, envir = base::.GlobalEnv)
-      if (isTRUE(result$visible)) {
-        if (!((is.data.frame(result$value) || is.matrix(result$value)) &&
-              isTRUE(capture(result$value)))) {
-          print(result$value)
+      if (base::isTRUE(result$visible)) {
+        if (!((base::is.data.frame(result$value) || base::is.matrix(result$value)) &&
+              base::isTRUE(capture(result$value)))) {
+          base_print <- base::call("::", base::quote(base), base::quote(print))
+          base_quote <- base::call("::", base::quote(base), base::quote(quote))
+          quoted_value <- base::as.call(base::list(base_quote, result$value))
+          print_call <- base::as.call(base::list(base_print, quoted_value))
+          base::eval(print_call, envir = base::globalenv())
         }
       }
     }

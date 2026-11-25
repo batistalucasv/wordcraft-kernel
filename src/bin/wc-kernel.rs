@@ -3,6 +3,7 @@
 //! Executes R and Python scripts directly from the terminal, with options
 //! for JSON serialization, custom timeouts, plot export, and stdin streaming.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+#![forbid(unsafe_code)]
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -109,6 +110,18 @@ fn next_text_arg(args: &mut impl Iterator<Item = OsString>, option: &str, expect
 
 fn next_path_arg(args: &mut impl Iterator<Item = OsString>, option: &str, expected: &str) -> Result<PathBuf, CliError> {
     args.next().map(PathBuf::from).ok_or_else(|| CliError::Usage(format!("option '{option}' requires an argument {expected}")))
+}
+
+fn parse_language_arg(val: &str) -> Result<CodeLanguage, CliError> {
+    CodeLanguage::from_str(val).map_err(|_| CliError::Usage(format!("unsupported language '{val}'. Expected 'r' or 'py'/'python'")))
+}
+
+fn parse_timeout_arg(val: &str) -> Result<u64, CliError> {
+    let ms: u64 = val.parse().map_err(|_| CliError::Usage(format!("invalid timeout '{val}'. Expected a positive integer in milliseconds")))?;
+    if ms == 0 {
+        return Err(CliError::Usage("timeout must be greater than zero".to_string()));
+    }
+    Ok(ms)
 }
 
 #[cfg(unix)]
@@ -287,53 +300,21 @@ where
         } else if arg == "--stdin" {
             cli.read_stdin = true;
         } else if arg == "-l" || arg == "--lang" {
-            let val = next_text_arg(&mut args, arg, "<r|py>")?;
-            let lang =
-                CodeLanguage::from_str(&val).map_err(|_| CliError::Usage(format!("unsupported language '{val}'. Expected 'r' or 'py'/'python'")))?;
-            cli.language = Some(lang);
-        } else if let Some(val) = arg.strip_prefix("--lang=") {
-            let lang =
-                CodeLanguage::from_str(val).map_err(|_| CliError::Usage(format!("unsupported language '{val}'. Expected 'r' or 'py'/'python'")))?;
-            cli.language = Some(lang);
-        } else if let Some(val) = arg.strip_prefix("-l=") {
-            let lang =
-                CodeLanguage::from_str(val).map_err(|_| CliError::Usage(format!("unsupported language '{val}'. Expected 'r' or 'py'/'python'")))?;
-            cli.language = Some(lang);
+            cli.language = Some(parse_language_arg(&next_text_arg(&mut args, arg, "<r|py>")?)?);
+        } else if let Some(val) = arg.strip_prefix("--lang=").or_else(|| arg.strip_prefix("-l=")) {
+            cli.language = Some(parse_language_arg(val)?);
         } else if arg == "-e" || arg == "--eval" {
-            let val = next_text_arg(&mut args, arg, "<code>")?;
-            cli.eval_snippets.push(val);
-        } else if let Some(val) = arg.strip_prefix("--eval=") {
-            cli.eval_snippets.push(val.to_string());
-        } else if let Some(val) = arg.strip_prefix("-e=") {
+            cli.eval_snippets.push(next_text_arg(&mut args, arg, "<code>")?);
+        } else if let Some(val) = arg.strip_prefix("--eval=").or_else(|| arg.strip_prefix("-e=")) {
             cli.eval_snippets.push(val.to_string());
         } else if arg == "-f" || arg == "--file" {
             set_file_path(&mut cli, next_path_arg(&mut args, arg, "<path>")?)?;
-        } else if let Some(val) = arg.strip_prefix("--file=") {
-            set_file_path(&mut cli, PathBuf::from(val))?;
-        } else if let Some(val) = arg.strip_prefix("-f=") {
+        } else if let Some(val) = arg.strip_prefix("--file=").or_else(|| arg.strip_prefix("-f=")) {
             set_file_path(&mut cli, PathBuf::from(val))?;
         } else if arg == "-t" || arg == "--timeout" {
-            let val = next_text_arg(&mut args, arg, "<ms>")?;
-            let ms: u64 =
-                val.parse().map_err(|_| CliError::Usage(format!("invalid timeout '{val}'. Expected a positive integer in milliseconds")))?;
-            if ms == 0 {
-                return Err(CliError::Usage("timeout must be greater than zero".to_string()));
-            }
-            cli.timeout_ms = ms;
-        } else if let Some(val) = arg.strip_prefix("--timeout=") {
-            let ms: u64 =
-                val.parse().map_err(|_| CliError::Usage(format!("invalid timeout '{val}'. Expected a positive integer in milliseconds")))?;
-            if ms == 0 {
-                return Err(CliError::Usage("timeout must be greater than zero".to_string()));
-            }
-            cli.timeout_ms = ms;
-        } else if let Some(val) = arg.strip_prefix("-t=") {
-            let ms: u64 =
-                val.parse().map_err(|_| CliError::Usage(format!("invalid timeout '{val}'. Expected a positive integer in milliseconds")))?;
-            if ms == 0 {
-                return Err(CliError::Usage("timeout must be greater than zero".to_string()));
-            }
-            cli.timeout_ms = ms;
+            cli.timeout_ms = parse_timeout_arg(&next_text_arg(&mut args, arg, "<ms>")?)?;
+        } else if let Some(val) = arg.strip_prefix("--timeout=").or_else(|| arg.strip_prefix("-t=")) {
+            cli.timeout_ms = parse_timeout_arg(val)?;
         } else if arg == "--out-plot" {
             cli.out_plot = Some(next_path_arg(&mut args, arg, "<path>")?);
         } else if let Some(val) = arg.strip_prefix("--out-plot=") {
@@ -345,11 +326,7 @@ where
             cli.plot_format = Some(parse_plot_format(val)?);
         } else if arg == "-C" || arg == "--cwd" || arg == "--working-dir" {
             cli.working_dir = Some(next_path_arg(&mut args, arg, "<dir>")?);
-        } else if let Some(val) = arg.strip_prefix("--cwd=") {
-            cli.working_dir = Some(PathBuf::from(val));
-        } else if let Some(val) = arg.strip_prefix("--working-dir=") {
-            cli.working_dir = Some(PathBuf::from(val));
-        } else if let Some(val) = arg.strip_prefix("-C=") {
+        } else if let Some(val) = arg.strip_prefix("--cwd=").or_else(|| arg.strip_prefix("--working-dir=")).or_else(|| arg.strip_prefix("-C=")) {
             cli.working_dir = Some(PathBuf::from(val));
         } else if arg == "-" {
             if cli.file_path.is_some() || cli.read_stdin {
@@ -370,20 +347,27 @@ where
         return Err(CliError::Usage("cannot specify '--out-plot' when '--no-plot' is enabled".to_string()));
     }
 
-    if let Some(ref path) = cli.out_plot
-        && let Some(extension_format) = plot_format_for_extension(path)
-    {
-        match cli.plot_format {
-            None => cli.plot_format = Some(extension_format),
-            Some(requested) if requested != extension_format && requested != PlotFormat::Both => {
+    if let Some(ref path) = cli.out_plot {
+        if let Some(ext) = path.extension() {
+            let Some(extension_format) = plot_format_for_extension(path) else {
                 return Err(CliError::Usage(format!(
-                    "conflicting --plot-format '{}' for output file '{}'. Use '{}' or 'both'",
-                    plot_format_name(requested),
+                    "unsupported output plot extension '.{}' for '{}'. Expected '.png' or '.svg'",
+                    ext.to_string_lossy(),
                     path.display(),
-                    plot_format_name(extension_format),
                 )));
+            };
+            match cli.plot_format {
+                None => cli.plot_format = Some(extension_format),
+                Some(requested) if requested != extension_format && requested != PlotFormat::Both => {
+                    return Err(CliError::Usage(format!(
+                        "conflicting --plot-format '{}' for output file '{}'. Use '{}' or 'both'",
+                        plot_format_name(requested),
+                        path.display(),
+                        plot_format_name(extension_format),
+                    )));
+                }
+                Some(_) => {}
             }
-            Some(_) => {}
         }
     }
 
@@ -433,10 +417,18 @@ fn run(cancelled: &AtomicBool) -> Result<ExitCode, CliError> {
             let source_dir = fs::canonicalize(path).ok().and_then(|canonical| canonical.parent().map(Path::to_path_buf));
             (content, inferred, source_dir)
         }
-    } else if cli.read_stdin || !io::stdin().is_terminal() {
+    } else if cli.read_stdin {
         let Some(text) = read_stdin(cancelled)? else {
             return Ok(ExitCode::from(130));
         };
+        (text, None, None)
+    } else if !io::stdin().is_terminal() {
+        let Some(text) = read_stdin(cancelled)? else {
+            return Ok(ExitCode::from(130));
+        };
+        if text.trim().is_empty() {
+            return Err(CliError::Usage("no code provided. Specify -e <code>, --file <path>, or pipe via stdin".to_string()));
+        }
         (text, None, None)
     } else {
         return Err(CliError::Usage("no code provided. Specify -e <code>, --file <path>, or pipe via stdin".to_string()));
@@ -450,20 +442,7 @@ fn run(cancelled: &AtomicBool) -> Result<ExitCode, CliError> {
         }
     };
 
-    let plot_format = match cli.plot_format {
-        Some(fmt) => fmt,
-        None => {
-            if let Some(ref path) = cli.out_plot {
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if ext.eq_ignore_ascii_case("svg") { PlotFormat::Svg } else { PlotFormat::Png }
-                } else {
-                    PlotFormat::Png
-                }
-            } else {
-                PlotFormat::Png
-            }
-        }
-    };
+    let plot_format = cli.plot_format.unwrap_or(PlotFormat::Png);
 
     let mut req =
         ExecutionRequest::new(language, code).with_timeout(cli.timeout_ms).with_plot_capture(cli.capture_plots).with_plot_format(plot_format);
@@ -701,6 +680,7 @@ mod tests {
         assert_usage_error(vec!["--timeout".to_string(), "0".to_string()])?;
         assert_usage_error(vec!["--lang".to_string(), "rust".to_string()])?;
         assert_usage_error(vec!["--plot-format".to_string(), "invalid".to_string()])?;
+        assert_usage_error(vec!["--out-plot".to_string(), "plot.jpg".to_string()])?;
         Ok(())
     }
 }

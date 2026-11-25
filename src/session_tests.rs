@@ -1494,3 +1494,24 @@ fn session_unrepresentable_timeout_is_rejected() {
         assert!(matches!(err, KernelError::SessionProtocol(_)));
     }
 }
+
+#[test]
+fn r_session_handles_payload_larger_than_64kib() {
+    let Some(mut manager) = manager_for(CodeLanguage::R) else {
+        return;
+    };
+
+    let big_literal = "a".repeat(128 * 1024);
+    let code = format!("s <- \"{big_literal}\"\ncat(\"len:\", nchar(s), \"\\n\", sep = \"\")\n");
+    let req = ExecutionRequest::new(CodeLanguage::R, code).with_timeout(15_000).with_plot_capture(false);
+    let res = manager.execute("r-large-payload", &req).expect("execute >64 KiB R payload");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert_eq!(res.stdout.trim(), format!("len:{}", 128 * 1024));
+
+    let follow_up = chunk(CodeLanguage::R, "cat(\"after:\", nchar(s), \"\\n\", sep = \"\")");
+    let res2 = manager.execute("r-large-payload", &follow_up).expect("follow-up after large payload");
+    assert!(res2.success, "stderr: {}", res2.stderr);
+    assert_eq!(res2.stdout.trim(), format!("after:{}", 128 * 1024));
+
+    manager.close_session("r-large-payload");
+}

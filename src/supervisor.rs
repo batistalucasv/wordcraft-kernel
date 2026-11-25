@@ -140,7 +140,18 @@ pub fn run() -> io::Result<()> {
         .and_then(|arg| arg.into_string().ok())
         .and_then(|arg| arg.parse::<u64>().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid timeout"))?;
-    let interpreter_args = args.collect::<Vec<_>>();
+
+    let mut pre_args = Vec::new();
+    let mut interpreter_args = Vec::new();
+    for arg in args {
+        if interpreter_args.is_empty()
+            && let Some(pre) = arg.to_str().and_then(|s| s.strip_prefix("--pre-arg="))
+        {
+            pre_args.push(OsString::from(pre));
+            continue;
+        }
+        interpreter_args.push(arg);
+    }
 
     ctrlc::set_handler(|| {
         CANCELLED.store(true, Ordering::Release);
@@ -150,7 +161,7 @@ pub fn run() -> io::Result<()> {
     #[cfg(target_os = "linux")]
     nix::sys::prctl::set_child_subreaper(true).map_err(|error| io::Error::other(format!("enable child subreaper: {error}")))?;
 
-    let result = execute_child(&binary, &script, &interpreter_args, Duration::from_millis(timeout_ms), &CANCELLED)
+    let result = execute_child(&binary, &pre_args, &script, &interpreter_args, Duration::from_millis(timeout_ms), &CANCELLED)
         .map_err(|error| io::Error::other(format!("supervise interpreter: {error}")))?;
     write_result(&result_file, result).map_err(|error| io::Error::other(format!("write result: {error}")))
 }
@@ -170,13 +181,14 @@ struct SupervisorResult {
 
 fn execute_child(
     binary: &Path,
+    pre_args: &[OsString],
     script: &Path,
     interpreter_args: &[OsString],
     timeout: Duration,
     cancelled: &AtomicBool,
 ) -> io::Result<SupervisorResult> {
     let mut command = Command::new(binary);
-    command.arg(script).args(interpreter_args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command.args(pre_args).arg(script).args(interpreter_args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let start = Instant::now();
     let mut child = spawn_child(&mut command).map_err(|error| io::Error::other(format!("spawn interpreter: {error}")))?;
@@ -206,7 +218,7 @@ fn execute_child(
         Ok(reader) => reader,
         Err(error) => {
             let cleanup = cleanup_process_tree(&mut child, child_pid, false);
-            stdout_cancel.store(true, Ordering::Release);
+            drop(stdout_cancel);
             let reader_cleanup = join_capture_reader(stdout_reader);
             return Err(cleanup_after_failure(error, cleanup, Some(reader_cleanup)));
         }
@@ -216,8 +228,8 @@ fn execute_child(
         .map_err(|error| io::Error::other(format!("wait for interpreter: {error}")));
     let child_reaped = outcome.as_ref().is_ok_and(|outcome| outcome.status.is_some());
     let process_cleanup = cleanup_process_tree(&mut child, child_pid, child_reaped);
-    stdout_cancel.store(true, Ordering::Release);
-    stderr_cancel.store(true, Ordering::Release);
+    drop(stdout_cancel);
+    drop(stderr_cancel);
     let stdout_cleanup = join_capture_reader(stdout_reader);
     let stderr_cleanup = join_capture_reader(stderr_reader);
 
@@ -230,8 +242,8 @@ fn execute_child(
         return Err(io::Error::new(io::ErrorKind::Interrupted, "interpreter execution was cancelled"));
     }
 
-    let stdout = stdout_sink.bytes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
-    let stderr = stderr_sink.bytes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+    let stdout = std::mem::take(&mut *stdout_sink.bytes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    let stderr = std::mem::take(&mut *stderr_sink.bytes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
 
     // A peeking platform observed the exit without reaping it, so the status only
     // becomes available after cleanup has signalled the group and reaped it.
@@ -258,7 +270,86 @@ fn cleanup_after_failure(primary: io::Error, process_cleanup: io::Result<()>, re
     if details.is_empty() { primary } else { io::Error::other(format!("{primary}; cleanup failed: {}", details.join("; "))) }
 }
 
-fn spawn_capture<R>(mut pipe: R, limit: usize) -> io::Result<(CaptureSink, Arc<AtomicBool>, JoinHandle<io::Result<()>>)>
+#[cfg(unix)]
+struct CaptureCancel(Option<std::os::fd::OwnedFd>);
+
+#[cfg(unix)]
+impl Drop for CaptureCancel {
+    fn drop(&mut self) {
+        // Closing the write end wakes `poll()` on the reader thread immediately.
+        drop(self.0.take());
+    }
+}
+
+#[cfg(not(unix))]
+struct CaptureCancel(Arc<AtomicBool>);
+
+#[cfg(not(unix))]
+impl Drop for CaptureCancel {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(unix)]
+fn drain_nonblocking<R: Read>(pipe: &mut R, sink: &CaptureSink, limit: usize) -> io::Result<bool> {
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) => return Ok(true),
+            Ok(read) => {
+                let mut bytes = sink.bytes.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let remaining = limit.saturating_sub(bytes.len());
+                if read > remaining {
+                    bytes.extend_from_slice(&chunk[..remaining]);
+                    drop(bytes);
+                    sink.truncated.store(true, Ordering::Release);
+                    return Ok(true);
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn spawn_capture<R>(mut pipe: R, limit: usize) -> io::Result<(CaptureSink, CaptureCancel, JoinHandle<io::Result<()>>)>
+where
+    R: Read + std::os::fd::AsFd + Send + 'static,
+{
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::os::fd::AsFd;
+
+    let (cancel_read, cancel_write) = nix::unistd::pipe().map_err(io::Error::other)?;
+    let sink = CaptureSink::new();
+    let thread_sink = sink.clone();
+    let reader = thread::Builder::new().name("wordcraft-output-capture".to_string()).spawn(move || -> io::Result<()> {
+        loop {
+            if drain_nonblocking(&mut pipe, &thread_sink, limit)? {
+                return Ok(());
+            }
+            let mut fds = [PollFd::new(pipe.as_fd(), PollFlags::POLLIN), PollFd::new(cancel_read.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut fds, PollTimeout::NONE) {
+                Ok(_) => {}
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(error) => return Err(io::Error::other(error)),
+            }
+            let cancelled = fds[1].revents().is_some_and(|events| !events.is_empty());
+            if cancelled {
+                // Drain any bytes buffered before the write end closed.
+                let _ = drain_nonblocking(&mut pipe, &thread_sink, limit)?;
+                return Ok(());
+            }
+        }
+    })?;
+    Ok((sink, CaptureCancel(Some(cancel_write)), reader))
+}
+
+#[cfg(not(unix))]
+fn spawn_capture<R>(mut pipe: R, limit: usize) -> io::Result<(CaptureSink, CaptureCancel, JoinHandle<io::Result<()>>)>
 where
     R: Read + Send + 'static,
 {
@@ -293,7 +384,7 @@ where
             }
         }
     })?;
-    Ok((sink, cancel, reader))
+    Ok((sink, CaptureCancel(cancel), reader))
 }
 
 #[cfg(unix)]
@@ -363,6 +454,7 @@ fn wait_with_timeout(
     cancelled: &AtomicBool,
 ) -> io::Result<WaitOutcome> {
     let start = Instant::now();
+    let mut poll_interval = Duration::from_millis(1);
     loop {
         let (exited, status) = observe_exit(child)?;
         if exited {
@@ -377,7 +469,8 @@ fn wait_with_timeout(
                 interrupted: true,
             });
         }
-        if start.elapsed() >= timeout {
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
             return Ok(WaitOutcome {
                 status: None,
                 exited: false,
@@ -390,7 +483,9 @@ fn wait_with_timeout(
             let (exited, status) = observe_exit(child)?;
             return Ok(WaitOutcome { status, exited, timed_out: false, output_limited: true, interrupted: false });
         }
-        thread::sleep(Duration::from_millis(10));
+        let remaining = timeout.saturating_sub(elapsed);
+        thread::sleep(poll_interval.min(remaining));
+        poll_interval = (poll_interval * 2).min(Duration::from_millis(10));
     }
 }
 
@@ -538,12 +633,14 @@ fn write_result(path: &Path, result: SupervisorResult) -> io::Result<()> {
         flags |= 2;
     }
     let exit_code = result.status.and_then(|status| status.code()).unwrap_or(i32::MIN);
+    let stdout_len = u32::try_from(result.stdout.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "stdout exceeds u32 limit"))?;
+    let stderr_len = u32::try_from(result.stderr.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "stderr exceeds u32 limit"))?;
     file.write_all(b"WCK1")?;
     file.write_all(&[flags])?;
     file.write_all(&exit_code.to_le_bytes())?;
     file.write_all(&result.duration_ms.to_le_bytes())?;
-    file.write_all(&(result.stdout.len() as u32).to_le_bytes())?;
-    file.write_all(&(result.stderr.len() as u32).to_le_bytes())?;
+    file.write_all(&stdout_len.to_le_bytes())?;
+    file.write_all(&stderr_len.to_le_bytes())?;
     file.write_all(&result.stdout)?;
     file.write_all(&result.stderr)?;
     file.flush()

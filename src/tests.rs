@@ -1083,3 +1083,112 @@ fn execution_directory_is_removed_after_execution() {
     assert!(directory.contains("wordcraft_"), "unexpected working directory: {directory}");
     assert!(!std::path::Path::new(directory).exists(), "temporary directory was left behind: {directory}");
 }
+
+#[test]
+fn read_supervisor_result_rejects_malformed_wck1_payloads() {
+    let dir = create_unique_scratch_dir("wordcraft-wck1-test", &SCRIPT_COUNTER, 10).expect("create temp dir");
+    let _guard = TempDirGuard(&dir);
+
+    let bad_magic = dir.join("bad_magic.bin");
+    fs::write(&bad_magic, b"BAD1\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00").unwrap();
+    assert!(read_supervisor_result(&bad_magic).is_err());
+
+    let bad_flags = dir.join("bad_flags.bin");
+    let mut bytes = Vec::from(*b"WCK1\x04");
+    bytes.extend_from_slice(&0_i32.to_le_bytes());
+    bytes.extend_from_slice(&1_u64.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    fs::write(&bad_flags, &bytes).unwrap();
+    assert!(read_supervisor_result(&bad_flags).is_err());
+
+    let oversized = dir.join("oversized.bin");
+    let mut bytes = Vec::from(*b"WCK1\x00");
+    bytes.extend_from_slice(&0_i32.to_le_bytes());
+    bytes.extend_from_slice(&1_u64.to_le_bytes());
+    bytes.extend_from_slice(&((MAX_CAPTURE_BYTES + 1) as u32).to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    fs::write(&oversized, &bytes).unwrap();
+    assert!(read_supervisor_result(&oversized).is_err());
+
+    let trailing = dir.join("trailing.bin");
+    let mut bytes = Vec::from(*b"WCK1\x00");
+    bytes.extend_from_slice(&i32::MIN.to_le_bytes());
+    bytes.extend_from_slice(&5_u64.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.push(0xff);
+    fs::write(&trailing, &bytes).unwrap();
+    assert!(read_supervisor_result(&trailing).is_err());
+
+    let valid_none_exit = dir.join("valid_none.bin");
+    let mut bytes = Vec::from(*b"WCK1\x01");
+    bytes.extend_from_slice(&i32::MIN.to_le_bytes());
+    bytes.extend_from_slice(&42_u64.to_le_bytes());
+    bytes.extend_from_slice(&2_u32.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(b"ok");
+    fs::write(&valid_none_exit, &bytes).unwrap();
+    let parsed = read_supervisor_result(&valid_none_exit).expect("valid WCK1 payload");
+    assert_eq!(parsed.exit_code, None);
+    assert!(parsed.timed_out);
+    assert!(!parsed.success);
+    assert_eq!(parsed.stdout, "ok");
+    assert_eq!(parsed.duration_ms, 42);
+}
+
+#[test]
+fn bounded_plot_readers_enforce_size_limit() {
+    let dir = create_unique_scratch_dir("wordcraft-plot-limit", &SCRIPT_COUNTER, 10).expect("create temp dir");
+    let _guard = TempDirGuard(&dir);
+
+    let png_path = dir.join("huge.png");
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    png.resize(128, 0);
+    fs::write(&png_path, &png).unwrap();
+    assert!(read_png_bounded(&png_path, 128).0.is_some());
+    assert_eq!(read_png_bounded(&png_path, 64), (None, true));
+
+    let svg_path = dir.join("huge.svg");
+    let svg = format!("<svg>{}</svg>", "x".repeat(128));
+    fs::write(&svg_path, &svg).unwrap();
+    assert!(read_svg_bounded(&svg_path, 256).0.is_some());
+    assert_eq!(read_svg_bounded(&svg_path, 64), (None, true));
+}
+
+#[test]
+fn executable_filtering_rejects_unusable_candidates() {
+    let dir = create_unique_scratch_dir("wordcraft-which-test", &SCRIPT_COUNTER, 10).expect("create temp dir");
+    let _guard = TempDirGuard(&dir);
+
+    assert!(!is_usable_executable(&dir));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let non_exec = dir.join("python3");
+        fs::write(&non_exec, b"#!/bin/sh\n").unwrap();
+        let mut perms = fs::metadata(&non_exec).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&non_exec, perms).unwrap();
+        assert!(!is_usable_executable(&non_exec), "non-executable file must be skipped");
+
+        let mut perms = fs::metadata(&non_exec).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&non_exec, perms).unwrap();
+        assert!(is_usable_executable(&non_exec));
+    }
+
+    #[cfg(windows)]
+    {
+        let apps_dir = dir.join("WindowsApps");
+        fs::create_dir(&apps_dir).unwrap();
+        let stub = apps_dir.join("python3.exe");
+        fs::write(&stub, b"").unwrap();
+        assert!(!is_usable_executable(&stub), "0-byte WindowsApps stub must be skipped");
+
+        let real = dir.join("python.exe");
+        fs::write(&real, b"MZ").unwrap();
+        assert!(is_usable_executable(&real));
+    }
+}
