@@ -1,8 +1,8 @@
 # Senior Tech Lead Architecture & Upstream Atomic-PR Roadmap: Interactive Code Chunks (`wordcraft-kernel` → `storytold/wordcraft`)
 
-> **Target Upstream**: `storytold/wordcraft` (`origin/main` at `6e92d33e`)  
+> **Target Upstream**: `storytold/wordcraft` (`origin/main` synced to `upstream/main` at `c179a316`)  
 > **Source Fork Stack**: `batistalucasv/wordcraft` draft PRs `#132`–`#137` (based on `upstream-base` `8b732263`, 65 commits behind `upstream/main`)  
-> **External Kernel Repo**: `batistalucasv/wordcraft-kernel` (`main` at `90804e9` → hardened on `perf/kernel-hardening` at `ff98432`)  
+> **External Kernel Repo**: `batistalucasv/wordcraft-kernel` (`main` at `e6b7a16` — all hardening + Win32 `SetStdHandle` fix merged)  
 > **Strategy**: Hybrid Architecture (A1) — Lean L1 `crates/kernel` + Refactored 9-PR Atomic Stack (+ Side-PRs 0a/0b + Follow-up PR 10 Persistent Daemon Client)
 
 ---
@@ -154,22 +154,50 @@ All implementation branches were built in isolated worktrees (linearly stacked o
 
 | Deliverable | Repo / Worktree | Branch | Commit SHA | Diff Summary | Verification Observed |
 |---|---|---|---|---|---|
-| **Hardened Kernel** | `batistalucasv/wordcraft-kernel` | `perf/kernel-hardening` | `ff98432e` | 7 files, `+991/-587` | `cargo fmt --check` PASS; Python 3.14.6 + Rscript 4.5.2 direct driver/TCP tests PASS; Rust link blocked (`link.exe` missing) |
-| **PR 1 (L1)** | `batistalucasv/wordcraft` (`wt-pr1-kernel`) | `feat/atomic-pr1-kernel` | `9a83a80f` | 8 files, `+4790` (`Cargo.lock` +11, 0 dup deps) | `cargo fmt --all -- --check` PASS; Python/R driver verify PASS; Rust check blocked (`link.exe` missing) |
-| **PR 2 (L1)** | `batistalucasv/wordcraft` (`wt-pr2-doc`) | `feat/atomic-pr2-doc-chunks` | `052687dc` | 7 files, `+2131/-1` (`chunk/{mod,codec,tests}.rs`) | `cargo fmt --all -- --check` PASS; Rust check blocked (`link.exe` missing) |
-| **PR 3 (L2)** | `batistalucasv/wordcraft` (`wt-pr3-formats`) | `feat/atomic-pr3-formats-quarto` | `07f91239` | 5 files, `+1988/-2` (`quarto/{mod,options,tests}.rs`) | `cargo fmt --all -- --check` PASS; Rust check blocked (`link.exe` missing) |
-| **PR 4 (L2)** | `batistalucasv/wordcraft` (`wt-pr4-layout`) | `feat/atomic-pr4-layout-chunks` | `bee8cf37` | 14 files, `+443/-25` (`Placed::Chunk` + `has_chunks`) | `cargo fmt --all -- --check` PASS; Rust check blocked (`link.exe` missing) |
-| **PR 5 (L4a)** | `batistalucasv/wordcraft` (`wt-pr5-engine`) | `feat/atomic-pr5-engine-code` | `cd5f00ef` | 17 files, `+3066/-4` (unified planner + `cfg(test)` stub) | `cargo fmt --all -- --check` PASS; Rust check blocked (`link.exe` missing) |
-| **PR 6 (L4b)** | `batistalucasv/wordcraft` (`wt-pr6-engine-io`) | `feat/atomic-pr6-engine-quarto-io` | `dc7a7363` | 6 files, `+453/-62` (Quarto I/O, `FileText`, tracked Enter) | `cargo fmt --all -- --check` PASS; Rust check blocked (`link.exe` missing) |
-| **PR 7 (L6a)** | `batistalucasv/wordcraft` (`wt-pr7-ui-widget`) | `feat/atomic-pr7-ui-widget` | `ebf6225c` | 6 files, `+2744` (`code_chunk/{mod,highlight,output,tests}.rs`) | `cargo fmt --all -- --check` PASS; Rust check blocked (`link.exe` missing) |
-| **PR 8 (L6b)** | `batistalucasv/wordcraft` (`wt-pr8-ui-canvas`) | `feat/atomic-pr8-ui-canvas` | `5423ab39` | 10 files, `+3421/-29` (`rev()` cache, `build_eframe`, `GoTo::Top`) | `cargo fmt --all -- --check` PASS; static lint/pattern scan PASS; Rust check blocked (`link.exe` missing) |
-| **PR 9 (L6c)** | `batistalucasv/wordcraft` (`wt-pr9-ui-app`) | `feat/atomic-pr9-ui-app` | `f710e87c` | 19 files, `+421/-35` (ribbon, `ATTRIBUTION.md`, dialogs, `Rig::new()`) | `cargo fmt --all -- --check` PASS; static scan PASS; Rust check blocked (`link.exe` missing) |
+| **Hardened Kernel** | `batistalucasv/wordcraft-kernel` | `main` (`perf/kernel-hardening`) | `e6b7a16` | 9 files, `+1207/-871` (vs `90804e9`) | **183/183 tests PASS** (`lib`: 129, `wc-kernel`: 7, `supervisor`: 1, `cli`: 19, `runner`: 26, doc: 1) with R 4.5.2 + Python 3.14.6 on `x86_64-pc-windows-gnu`; `cargo fmt --check` PASS |
+| **PR 1 (L1)** | `batistalucasv/wordcraft` (`wt-pr1-kernel`) | `feat/atomic-pr1-kernel` | `9a83a80f` | 8 files, `+4790` (`Cargo.lock` +11, 0 dup deps) | `cargo fmt --all -- --check` PASS; compiles in full stack |
+| **PR 2 (L1)** | `batistalucasv/wordcraft` (`wt-pr2-doc`) | `feat/atomic-pr2-doc-chunks` | `052687dc` | 7 files, `+2131/-1` (`chunk/{mod,codec,tests}.rs`) | `cargo fmt --all -- --check` PASS; compiles in full stack |
+| **PR 3 (L2)** | `batistalucasv/wordcraft` (`wt-pr3-formats`) | `feat/atomic-pr3-formats-quarto` | `07f91239` | 5 files, `+1988/-2` (`quarto/{mod,options,tests}.rs`) | `cargo fmt --all -- --check` PASS; compiles in full stack |
+| **PR 4 (L2)** | `batistalucasv/wordcraft` (`wt-pr4-layout`) | `feat/atomic-pr4-layout-chunks` | `bee8cf37` | 14 files, `+443/-25` (`Placed::Chunk` + `has_chunks`) | `cargo fmt --all -- --check` PASS; compiles in full stack |
+| **PR 5 (L4a)** | `batistalucasv/wordcraft` (`wt-pr5-engine`) | `feat/atomic-pr5-engine-code` | `cd5f00ef` | 17 files, `+3066/-4` (unified planner + `cfg(test)` stub) | `cargo fmt --all -- --check` PASS; compiles in full stack |
+| **PR 6 (L4b)** | `batistalucasv/wordcraft` (`wt-pr6-engine-io`) | `feat/atomic-pr6-engine-quarto-io` | `dc7a7363` | 6 files, `+453/-62` (Quarto I/O, `FileText`, tracked Enter) | `cargo fmt --all -- --check` PASS; compiles in full stack |
+| **PR 7 (L6a)** | `batistalucasv/wordcraft` (`wt-pr7-ui-widget`) | `feat/atomic-pr7-ui-widget` | `ebf6225c` | 6 files, `+2744` (`code_chunk/{mod,highlight,output,tests}.rs`) | `cargo fmt --all -- --check` PASS; compiles in full stack |
+| **PR 8 (L6b)** | `batistalucasv/wordcraft` (`wt-pr8-ui-canvas`) | `feat/atomic-pr8-ui-canvas` | `5423ab39` | 10 files, `+3421/-29` (`rev()` cache, `build_eframe`, `GoTo::Top`) | `cargo fmt --all -- --check` PASS; compiles in full stack |
+| **PR 9 (L6c + UX fixes)** | `batistalucasv/wordcraft` (`wt-pr9-ui-app`) | `feat/atomic-pr9-ui-app` | `7576980c` | Full stack compiled to `wordcraft.exe` (`x86_64-pc-windows-gnu`) | Interactive desktop test PASS (R & Python execution, click-to-edit `Area`, `⋮⋮` drag-to-move `code.move_chunk`, `Fit` plot default, non-truncating tabs, bold title) |
 
 ---
 
-## 5. Upstream CI & Submission Runbook
+## 5. Submission Plan to `storytold/wordcraft`
 
-Run the full upstream gate on a Linux/macOS host or Windows with Visual Studio MSVC Build Tools (`link.exe` + Windows SDK) installed, and validate on `batistalucasv/wordcraft` GitHub Actions before opening PRs against `storytold/wordcraft`:
+### 5.1 Pre-Submission Cleanup (Distribute `7576980c` Fixes)
+Commit `7576980c` on `feat/atomic-pr9-ui-app` contains fixes discovered during live desktop testing. Before opening individual PRs against `storytold/wordcraft`, split those fixes back into their owning PRs and **drop** the local-GNU-only manifest:
+1. **Drop `apps/wordcraft/build.rs` manifest change**: only needed for local `x86_64-pc-windows-gnu` testing; upstream builds on MSVC/Linux/macOS.
+2. **Move `code.move_chunk` (`crates/engine/src/cmd/code.rs`) → PR 5 (`feat/atomic-pr5-engine-code`)**.
+3. **Move `code_chunk/{mod.rs, output.rs}` fixes → PR 7 (`feat/atomic-pr7-ui-widget`)**: `disclosure` import path, `CharIndex::into()`, `plot_auto_fit`, button output tabs (no `...`), `⋮⋮` drag grip, bold title, `editor_clicked`.
+4. **Move `canvas/` fixes → PR 8 (`feat/atomic-pr8-ui-canvas`)**: `CodeChunkAction::Run` match arm, `egui::Area` layer mounting (use `egui::Id::unique` to avoid `Id::new` deprecation), `just_focused_by_click`, `handle_chunk_drag` / `drop_preview_y`, `input.rs` drag guard.
+5. **Rebase PR 6 → PR 8 → PR 9** cleanly onto updated PR 5 / PR 7 so each PR has zero cross-layer leakage.
+
+### 5.2 Wave-by-Wave PR Opening & Merge Order
+Open and merge PRs to `storytold/wordcraft` (`main`) in dependency waves (each PR waits for the previous wave's merge, or stacks cleanly while under review):
+1. **Wave A (Base L1, independent — open together)**:
+   - **PR 1**: `feat/atomic-pr1-kernel` (`crates/kernel`, `Cargo.toml`, `Cargo.lock`, `xtask/src/layers.rs`)
+   - **PR 2**: `feat/atomic-pr2-doc-chunks` (`crates/doc`, `crates/docx`)
+2. **Wave B (L2, after PR 2)**:
+   - **PR 3**: `feat/atomic-pr3-formats-quarto` (`crates/formats`)
+   - **PR 4**: `feat/atomic-pr4-layout-chunks` (`crates/layout`)
+3. **Wave C (L4, after PR 1 + PR 2 + PR 4, and PR 3 for PR 6)**:
+   - **PR 5**: `feat/atomic-pr5-engine-code` (`crates/engine` core + `code.*` + `code.move_chunk`)
+   - **PR 6**: `feat/atomic-pr6-engine-quarto-io` (`crates/engine` Quarto I/O, after PR 3 & PR 5)
+4. **Wave D (L6, after PR 4 + PR 5 + PR 6)**:
+   - **PR 7**: `feat/atomic-pr7-ui-widget` (`CodeChunk` widget + `code_chunk_shot`)
+   - **PR 8**: `feat/atomic-pr8-ui-canvas` (canvas mounting, `egui::Area`, `session.rev()` cache, async pool, drag-to-move)
+   - **PR 9**: `feat/atomic-pr9-ui-app` (ribbon `Insert → Code`, `codeChunk.svg`, `ATTRIBUTION.md`, Quarto file dialogs, multi-window)
+5. **Optional Independent / Follow-up**:
+   - **Side-PRs 0a / 0b**: `file.save` `"copy": true` and `BytesFingerprint` (completely independent of code chunks).
+   - **Follow-up PR 10**: `crates/kernel-client` (L5 persistent daemon client for `batistalucasv/wordcraft-kernel`).
+
+### 5.3 Upstream CI Gate (Run Before Each PR Submission)
+Run on Linux/macOS or Windows with MSVC (`link.exe` + Windows SDK) and verify green on `batistalucasv/wordcraft` GitHub Actions before opening against `storytold/wordcraft`:
 
 ```powershell
 cargo fmt --all -- --check
